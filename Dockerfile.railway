@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir \
     requests>=2.31.0
 
 COPY backend/ ./backend/
+COPY locales/ ./locales/
 
 WORKDIR /app/backend
 
