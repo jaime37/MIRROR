@@ -42,11 +42,15 @@ def create_app(config_class=Config):
     # 启用CORS
     CORS(app, resources={r"/api/*": {"origins": "*"}})
     
-    # 注册模拟进程清理函数（确保服务器关闭时终止所有模拟进程）
-    from .services.simulation_runner import SimulationRunner
-    SimulationRunner.register_cleanup()
-    if should_log_startup:
-        logger.info("已注册模拟进程清理函数")
+    # 注册模拟进程清理函数（仅在camel-oasis可用时）
+    try:
+        from .services.simulation_runner import SimulationRunner
+        SimulationRunner.register_cleanup()
+        if should_log_startup:
+            logger.info("已注册模拟进程清理函数")
+    except ImportError:
+        if should_log_startup:
+            logger.info("camel-oasis no disponible — modo bot ligero activo")
     
     # 请求日志中间件
     @app.before_request

@@ -1,0 +1,36 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
+
+WORKDIR /app
+
+# Install only lightweight bot dependencies (no camel-oasis/camel-ai/PyTorch)
+RUN pip install --no-cache-dir \
+    flask>=3.0.0 \
+    flask-cors>=6.0.0 \
+    openai>=1.0.0 \
+    zep-cloud==3.13.0 \
+    PyMuPDF>=1.24.0 \
+    charset-normalizer>=3.0.0 \
+    chardet>=5.0.0 \
+    python-dotenv>=1.0.0 \
+    pydantic>=2.0.0 \
+    ddgs>=9.14.0 \
+    requests>=2.31.0
+
+COPY backend/ ./backend/
+
+WORKDIR /app/backend
+
+ENV FLASK_HOST=0.0.0.0
+ENV FLASK_PORT=5001
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/backend
+
+EXPOSE 5001
+
+CMD ["python", "run.py"]
