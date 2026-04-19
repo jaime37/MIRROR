@@ -5,19 +5,36 @@ from flask import request, has_request_context
 
 _thread_local = threading.local()
 
+# ── Embedded fallback data (used when locales/ directory is not present) ──────
+_FALLBACK_LANGUAGES = {
+    "zh": {"label": "中文",    "llmInstruction": "请使用中文回答。"},
+    "en": {"label": "English", "llmInstruction": "Please respond in English."},
+    "es": {"label": "Español", "llmInstruction": "Por favor, responde en español."},
+    "fr": {"label": "Français","llmInstruction": "Veuillez répondre en français."},
+    "pt": {"label": "Português","llmInstruction": "Por favor, responda em português."},
+    "ru": {"label": "Русский", "llmInstruction": "Пожалуйста, отвечайте на русском языке."},
+    "de": {"label": "Deutsch", "llmInstruction": "Bitte antworten Sie auf Deutsch."},
+}
+
 _locales_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'locales')
 
-# Load language registry
-with open(os.path.join(_locales_dir, 'languages.json'), 'r', encoding='utf-8') as f:
-    _languages = json.load(f)
+# Load language registry (falls back to embedded data if directory missing)
+try:
+    with open(os.path.join(_locales_dir, 'languages.json'), 'r', encoding='utf-8') as f:
+        _languages = json.load(f)
+except (FileNotFoundError, OSError):
+    _languages = _FALLBACK_LANGUAGES
 
-# Load translation files
-_translations = {}
-for filename in os.listdir(_locales_dir):
-    if filename.endswith('.json') and filename != 'languages.json':
-        locale_name = filename[:-5]
-        with open(os.path.join(_locales_dir, filename), 'r', encoding='utf-8') as f:
-            _translations[locale_name] = json.load(f)
+# Load translation files (silently skip if directory missing)
+_translations: dict = {}
+try:
+    for filename in os.listdir(_locales_dir):
+        if filename.endswith('.json') and filename != 'languages.json':
+            locale_name = filename[:-5]
+            with open(os.path.join(_locales_dir, filename), 'r', encoding='utf-8') as f:
+                _translations[locale_name] = json.load(f)
+except (FileNotFoundError, OSError):
+    pass  # No translations available — t() will return the key as-is
 
 
 def set_locale(locale: str):
