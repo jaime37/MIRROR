@@ -27,18 +27,22 @@ def main():
     # 验证配置
     errors = Config.validate()
     if errors:
-        print("配置错误:")
+        # On Railway / lightweight mode, ZEP_API_KEY may be absent (Zep not used by the autonomous bot).
+        # Only abort if LLM_API_KEY is missing — that one is truly required.
+        fatal = [e for e in errors if "LLM_API_KEY" in e]
         for err in errors:
-            print(f"  - {err}")
-        print("\n请检查 .env 文件中的配置")
-        sys.exit(1)
+            print(f"  ⚠ {err}")
+        if fatal:
+            print("\n请检查环境变量中的 LLM_API_KEY 配置")
+            sys.exit(1)
     
     # 创建应用
     app = create_app()
     
     # 获取运行配置
+    # Railway injects PORT; fall back to FLASK_PORT, then 8080
     host = os.environ.get('FLASK_HOST', '0.0.0.0')
-    port = int(os.environ.get('FLASK_PORT', 5001))
+    port = int(os.environ.get('PORT') or os.environ.get('FLASK_PORT', 8080))
     debug = Config.DEBUG
     
     # 启动服务
