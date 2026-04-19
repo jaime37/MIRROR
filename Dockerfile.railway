@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir \
     ddgs>=9.14.0 \
     requests>=2.31.0
 
+# cache-bust: 20260419-v4
 COPY backend/ ./backend/
 COPY locales/ ./locales/
 
