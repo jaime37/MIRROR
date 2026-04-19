@@ -5,6 +5,9 @@
       <div class="nav-brand">MIROFISH</div>
       <div class="nav-links">
         <LanguageSwitcher />
+        <router-link to="/paper-trading" class="paper-trading-link">
+          📈 Paper Trading
+        </router-link>
         <a href="https://github.com/666ghj/MiroFish" target="_blank" class="github-link">
           {{ $t('nav.visitGithub') }} <span class="arrow">↗</span>
         </a>
@@ -358,6 +361,25 @@ const startSimulation = () => {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+
+.paper-trading-link {
+  color: #7c6af7;
+  text-decoration: none;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  border: 1px solid #7c6af7;
+  border-radius: 20px;
+  transition: background 0.2s, color 0.2s;
+}
+.paper-trading-link:hover {
+  background: #7c6af7;
+  color: #fff;
 }
 
 .github-link {
