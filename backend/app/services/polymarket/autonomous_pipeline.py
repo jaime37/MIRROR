@@ -34,15 +34,17 @@ DEFAULT_SETTINGS = {
     "max_markets_per_cycle": 10,
     "position_size_usdc": 200.0,
     "min_edge": 0.07,
-    "min_confidence": ["high", "medium", "low"],
+    "min_confidence": ["high", "medium"],   # skip low-confidence trades
     "take_profit": 0.20,
     "stop_loss": -0.15,
     "cycle_interval_minutes": 30,
     "max_open_positions": 8,
-    "min_volume": 5000,      # markets with enough real liquidity
+    "min_volume": 5000,
     "min_liquidity": 1000,
+    "min_entry_price": 0.05,    # skip penny markets (< 5% probability)
+    "stoploss_cooldown_days": 7, # don't re-enter a market for 7 days after stop-loss
     "auto_close": True,
-    "delay_between_markets": 8,  # seconds between LLM calls to avoid rate limits
+    "delay_between_markets": 8,
 }
 
 # Where run logs are stored
@@ -178,12 +180,36 @@ class AutonomousPipeline:
                 markets_scanned = len(markets)
 
                 # ── Step 4: Research + signal + trade ────────────────────────
+                # Build cooldown list: markets stopped out recently
+                cooldown_days = self.settings.get("stoploss_cooldown_days", 7)
+                closed_trades = self.db.get_trades()
+                from datetime import timedelta
+                now_utc = datetime.now(timezone.utc)
+                cooled_ids = set()
+                for t in closed_trades:
+                    if t.get("reason") == "stop_loss":
+                        try:
+                            closed_at = datetime.fromisoformat(t["timestamp"].replace("Z", "+00:00"))
+                            if (now_utc - closed_at) < timedelta(days=cooldown_days):
+                                cooled_ids.add(t["market_id"])
+                        except Exception:
+                            pass
+
                 for market in markets:
                     if market.id in open_pos:
+                        continue
+                    if market.id in cooled_ids:
+                        log(f"   ⏳ Skipping {market.question[:50]} — stop-loss cooldown ({cooldown_days}d)")
                         continue
                     if len(self.db.get_portfolio().get("positions", {})) >= max_pos:
                         log("Max positions reached mid-cycle — stopping")
                         break
+
+                    # Skip penny markets (price < min_entry_price on BOTH sides)
+                    min_price = self.settings.get("min_entry_price", 0.05)
+                    if market.yes_price < min_price and market.no_price < min_price:
+                        log(f"   💸 Skipping penny market: {market.question[:50]} (yes={market.yes_price:.4f})")
+                        continue
 
                     log(f"🔍 Researching: {market.question[:60]}…")
                     # Pace LLM calls to stay within rate limits
