@@ -205,10 +205,13 @@ class AutonomousPipeline:
                         log("Max positions reached mid-cycle — stopping")
                         break
 
-                    # Skip penny markets (price < min_entry_price on BOTH sides)
+                    # Skip markets where the lower-probability side is below min_entry_price.
+                    # In a binary market YES+NO≈1, so if min(yes,no) < 0.05 it means
+                    # one outcome is < 5% — betting on it is a lottery ticket.
                     min_price = self.settings.get("min_entry_price", 0.05)
-                    if market.yes_price < min_price and market.no_price < min_price:
-                        log(f"   💸 Skipping penny market: {market.question[:50]} (yes={market.yes_price:.4f})")
+                    if min(market.yes_price, market.no_price) < min_price:
+                        log(f"   💸 Skipping penny market: {market.question[:50]} "
+                            f"(yes={market.yes_price:.4f} no={market.no_price:.4f})")
                         continue
 
                     log(f"🔍 Researching: {market.question[:60]}…")
@@ -247,6 +250,11 @@ class AutonomousPipeline:
 
                     side = "YES" if edge > 0 else "NO"
                     entry_price = market.yes_price if side == "YES" else market.no_price
+
+                    # Secondary safety: entry price itself must be above threshold
+                    if entry_price < min_price:
+                        log(f"   💸 Entry price too low for {side}: {entry_price:.4f} — skip")
+                        continue
 
                     log(
                         f"   ✅ EDGE FOUND: {side} | est={prob:.2f} mkt={market.yes_price:.2f} "
