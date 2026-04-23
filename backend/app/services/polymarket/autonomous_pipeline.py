@@ -41,8 +41,9 @@ DEFAULT_SETTINGS = {
     "max_open_positions": 8,
     "min_volume": 5000,
     "min_liquidity": 1000,
-    "min_entry_price": 0.05,    # skip penny markets (< 5% probability)
-    "stoploss_cooldown_days": 7, # don't re-enter a market for 7 days after stop-loss
+    "min_entry_price": 0.05,       # skip penny markets (< 5% probability)
+    "stoploss_cooldown_days": 7,   # don't re-enter a market for 7 days after stop-loss
+    "takeprofit_cooldown_days": 3, # don't re-enter a market for 3 days after take-profit
     "auto_close": True,
     "delay_between_markets": 8,
 }
@@ -180,17 +181,20 @@ class AutonomousPipeline:
                 markets_scanned = len(markets)
 
                 # ── Step 4: Research + signal + trade ────────────────────────
-                # Build cooldown list: markets stopped out recently
+                # Build cooldown list: markets closed recently (stop-loss OR take-profit)
                 cooldown_days = self.settings.get("stoploss_cooldown_days", 7)
+                tp_cooldown_days = self.settings.get("takeprofit_cooldown_days", 3)
                 closed_trades = self.db.get_trades()
                 from datetime import timedelta
                 now_utc = datetime.now(timezone.utc)
                 cooled_ids = set()
                 for t in closed_trades:
-                    if t.get("reason") == "stop_loss":
+                    reason = t.get("reason", "")
+                    days = cooldown_days if reason == "stop_loss" else tp_cooldown_days if reason == "take_profit" else 0
+                    if days > 0:
                         try:
                             closed_at = datetime.fromisoformat(t["timestamp"].replace("Z", "+00:00"))
-                            if (now_utc - closed_at) < timedelta(days=cooldown_days):
+                            if (now_utc - closed_at) < timedelta(days=days):
                                 cooled_ids.add(t["market_id"])
                         except Exception:
                             pass
@@ -199,7 +203,7 @@ class AutonomousPipeline:
                     if market.id in open_pos:
                         continue
                     if market.id in cooled_ids:
-                        log(f"   ⏳ Skipping {market.question[:50]} — stop-loss cooldown ({cooldown_days}d)")
+                        log(f"   ⏳ Skipping {market.question[:50]} — recently closed cooldown")
                         continue
                     if len(self.db.get_portfolio().get("positions", {})) >= max_pos:
                         log("Max positions reached mid-cycle — stopping")
