@@ -133,13 +133,26 @@ class AutonomousPipeline:
             open_pos = portfolio.get("positions", {})
             balance = portfolio.get("balance", 0)
 
-            # ── Step 1: Auto-close positions that hit TP/SL ──────────────────
+            # ── Step 1: Auto-close positions that hit TP/SL or are expired ──────
             if self.settings.get("auto_close") and open_pos:
-                log(f"Checking {len(open_pos)} open positions for TP/SL…")
+                log(f"Checking {len(open_pos)} open positions for TP/SL/expiry…")
                 for market_id, pos in list(open_pos.items()):
                     pnl_pct = (pos.get("current_value", pos["cost_basis"]) - pos["cost_basis"]) / pos["cost_basis"]
                     tp = self.settings.get("take_profit", 0.20)
                     sl = self.settings.get("stop_loss", -0.15)
+
+                    # Auto-close positions open more than 14 days (market likely expired/resolved)
+                    try:
+                        opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
+                        days_open = (datetime.now(timezone.utc) - opened_at).days
+                        if days_open >= 14:
+                            log(f"⏰ Closing expired position ({days_open}d): {pos['question'][:50]}")
+                            self.trader.close_position(market_id, pos["current_price"], reason="expired")
+                            trades_closed += 1
+                            continue
+                    except Exception:
+                        pass
+
                     if pnl_pct >= tp:
                         log(f"✅ TP hit on {pos['question'][:50]} (+{pnl_pct*100:.1f}%) — closing")
                         try:
