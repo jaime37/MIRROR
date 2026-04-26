@@ -82,8 +82,18 @@ def create_app(config_class=Config):
     def index():
         return {'service': 'MiroFish Backend', 'status': 'ok', 'docs': '/health'}
     
+    # Auto-start the autonomous bot on server startup
+    try:
+        from .services.polymarket.autonomous_pipeline import start_bot
+        start_bot()
+        if should_log_startup:
+            logger.info("🤖 Autonomous bot auto-started")
+    except Exception as e:
+        if should_log_startup:
+            logger.warning(f"Bot auto-start failed: {e}")
+
     if should_log_startup:
         logger.info("MiroFish Backend 启动完成")
-    
+
     return app
 
