@@ -29,6 +29,7 @@ class PaperTrader:
         reasoning: str,
         simulation_id: Optional[str] = None,
         report_id: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> dict:
         """Opens a new paper position. Returns the trade record."""
         portfolio = self.db.get_portfolio()
@@ -63,6 +64,7 @@ class PaperTrader:
             "simulation_id": simulation_id,
             "report_id": report_id,
             "opened_at": datetime.now(timezone.utc).isoformat(),
+            "end_date": end_date or "",
             "status": "open",
         }
 

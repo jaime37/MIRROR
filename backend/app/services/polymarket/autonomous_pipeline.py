@@ -141,12 +141,27 @@ class AutonomousPipeline:
                     tp = self.settings.get("take_profit", 0.20)
                     sl = self.settings.get("stop_loss", -0.15)
 
-                    # Auto-close positions open more than 14 days (market likely expired/resolved)
+                    # Auto-close if market end_date has passed (+ 2 day grace period)
+                    try:
+                        end_date_str = pos.get("end_date", "")
+                        if end_date_str:
+                            from dateutil import parser as dateparser
+                            end_dt = dateparser.parse(end_date_str)
+                            if end_dt and end_dt.tzinfo is None:
+                                end_dt = end_dt.replace(tzinfo=timezone.utc)
+                            if end_dt and datetime.now(timezone.utc) > end_dt + timedelta(days=2):
+                                log(f"⏰ Market expired on {end_date_str[:10]}: {pos['question'][:50]}")
+                                self.trader.close_position(market_id, pos["current_price"], reason="expired")
+                                trades_closed += 1
+                                continue
+                    except Exception:
+                        pass
+                    # Fallback: auto-close positions open more than 14 days
                     try:
                         opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
                         days_open = (datetime.now(timezone.utc) - opened_at).days
                         if days_open >= 14:
-                            log(f"⏰ Closing expired position ({days_open}d): {pos['question'][:50]}")
+                            log(f"⏰ Closing stale position ({days_open}d): {pos['question'][:50]}")
                             self.trader.close_position(market_id, pos["current_price"], reason="expired")
                             trades_closed += 1
                             continue
@@ -291,6 +306,7 @@ class AutonomousPipeline:
                             estimated_prob=prob,
                             confidence=confidence,
                             reasoning=signal.get("reasoning", ""),
+                            end_date=market.end_date,
                         )
                         trades_opened += 1
                         log(f"   💰 Position opened: {side} ${size:.0f} @ {entry_price:.4f}")
