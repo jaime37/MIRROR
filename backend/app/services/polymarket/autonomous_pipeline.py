@@ -79,8 +79,16 @@ def save_settings(settings: dict):
 def _load_runs() -> list:
     if not os.path.exists(LOG_FILE):
         return []
-    with open(LOG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            return json.load(f)
+    except Exception:
+        # Corrupted file — reset it
+        try:
+            os.remove(LOG_FILE)
+        except Exception:
+            pass
+        return []
 
 
 def _save_run(run: dict):
@@ -374,8 +382,11 @@ def get_bot_status() -> dict:
 def start_bot():
     global _bot_thread, _stop_event
     if _bot_thread and _bot_thread.is_alive():
-        return {"started": False, "reason": "Bot is already running"}
+        # Stop existing instance before starting a new one (prevents double bot)
+        _stop_event.set()
+        _bot_thread.join(timeout=5)
 
+    _stop_event = threading.Event()
     _stop_event.clear()
 
     def loop():
