@@ -18,7 +18,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from .market_fetcher import MarketFetcher
@@ -38,7 +38,7 @@ DEFAULT_SETTINGS = {
     "take_profit": 0.20,
     "stop_loss": -0.15,
     "cycle_interval_minutes": 30,
-    "max_open_positions": 8,
+    "max_open_positions": 5,
     "min_volume": 5000,
     "min_liquidity": 1000,
     "min_entry_price": 0.05,       # skip penny markets (< 5% probability)
@@ -55,6 +55,7 @@ SETTINGS_FILE = os.path.join(LOG_DIR, "bot_settings.json")
 
 _bot_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
+_LAST_START_FILE = os.path.join(LOG_DIR, ".bot_last_start")
 
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
@@ -221,7 +222,6 @@ class AutonomousPipeline:
                 cooldown_days = self.settings.get("stoploss_cooldown_days", 7)
                 tp_cooldown_days = self.settings.get("takeprofit_cooldown_days", 3)
                 closed_trades = self.db.get_trades()
-                from datetime import timedelta
                 now_utc = datetime.now(timezone.utc)
                 cooled_ids = set()
                 for t in closed_trades:
@@ -381,6 +381,28 @@ def get_bot_status() -> dict:
 
 def start_bot():
     global _bot_thread, _stop_event
+
+    # Cross-process debounce: refuse to start if another process started within 90s.
+    # Prevents triple-bot when Railway restarts the container rapidly.
+    os.makedirs(LOG_DIR, exist_ok=True)
+    now_ts = time.time()
+    if os.path.exists(_LAST_START_FILE):
+        try:
+            with open(_LAST_START_FILE, "r") as _f:
+                _last = float(_f.read().strip())
+            if now_ts - _last < 90:
+                logger.warning(
+                    f"start_bot() called only {now_ts - _last:.0f}s after last start — skipping duplicate"
+                )
+                return {"started": False, "reason": "too_soon"}
+        except Exception:
+            pass
+    try:
+        with open(_LAST_START_FILE, "w") as _f:
+            _f.write(str(now_ts))
+    except Exception:
+        pass
+
     if _bot_thread and _bot_thread.is_alive():
         # Stop existing instance before starting a new one (prevents double bot)
         _stop_event.set()
