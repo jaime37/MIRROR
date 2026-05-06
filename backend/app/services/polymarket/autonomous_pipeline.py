@@ -46,6 +46,7 @@ DEFAULT_SETTINGS = {
     "takeprofit_cooldown_days": 3, # don't re-enter a market for 3 days after take-profit
     "auto_close": True,
     "delay_between_markets": 8,
+    "max_days_to_expiry": 60,        # skip markets expiring more than 60 days out
 }
 
 # Where run logs are stored
@@ -244,6 +245,22 @@ class AutonomousPipeline:
                     if len(self.db.get_portfolio().get("positions", {})) >= max_pos:
                         log("Max positions reached mid-cycle — stopping")
                         break
+
+                    # Skip markets expiring too far in the future (capital rotation filter).
+                    max_days = self.settings.get("max_days_to_expiry", 60)
+                    if max_days and market.end_date:
+                        try:
+                            from dateutil import parser as dateparser
+                            end_dt = dateparser.parse(market.end_date)
+                            if end_dt and end_dt.tzinfo is None:
+                                end_dt = end_dt.replace(tzinfo=timezone.utc)
+                            if end_dt:
+                                days_left = (end_dt - datetime.now(timezone.utc)).days
+                                if days_left > max_days:
+                                    log(f"   📅 Skipping far expiry ({days_left}d): {market.question[:50]}")
+                                    continue
+                        except Exception:
+                            pass
 
                     # Skip markets where the lower-probability side is below min_entry_price.
                     # In a binary market YES+NO≈1, so if min(yes,no) < 0.05 it means
