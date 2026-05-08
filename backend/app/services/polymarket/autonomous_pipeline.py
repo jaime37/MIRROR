@@ -46,7 +46,8 @@ DEFAULT_SETTINGS = {
     "takeprofit_cooldown_days": 3, # don't re-enter a market for 3 days after take-profit
     "auto_close": True,
     "delay_between_markets": 8,
-    "max_days_to_expiry": 60,        # skip markets expiring more than 60 days out
+    "max_days_to_expiry": 60,          # threshold to classify a market as "long-term"
+    "long_term_position_ratio": 0.30,  # max 30% of slots reserved for long-term markets
 }
 
 # Where run logs are stored
@@ -246,8 +247,11 @@ class AutonomousPipeline:
                         log("Max positions reached mid-cycle — stopping")
                         break
 
-                    # Skip markets expiring too far in the future (capital rotation filter).
+                    # 70/30 long-term cap: allow at most 30% of slots for markets
+                    # expiring more than max_days_to_expiry days away.
                     max_days = self.settings.get("max_days_to_expiry", 60)
+                    lt_ratio = self.settings.get("long_term_position_ratio", 0.30)
+                    max_lt = max(1, int(max_pos * lt_ratio))
                     if max_days and market.end_date:
                         try:
                             from dateutil import parser as dateparser
@@ -257,8 +261,24 @@ class AutonomousPipeline:
                             if end_dt:
                                 days_left = (end_dt - datetime.now(timezone.utc)).days
                                 if days_left > max_days:
-                                    log(f"   📅 Skipping far expiry ({days_left}d): {market.question[:50]}")
-                                    continue
+                                    # Count existing long-term open positions
+                                    lt_open = 0
+                                    for pos in open_pos.values():
+                                        ed = pos.get("end_date", "")
+                                        if ed:
+                                            try:
+                                                pe = dateparser.parse(ed)
+                                                if pe and pe.tzinfo is None:
+                                                    pe = pe.replace(tzinfo=timezone.utc)
+                                                if pe and (pe - datetime.now(timezone.utc)).days > max_days:
+                                                    lt_open += 1
+                                            except Exception:
+                                                pass
+                                    if lt_open >= max_lt:
+                                        log(f"   📅 Long-term cap ({lt_open}/{max_lt}) — skipping {days_left}d: {market.question[:50]}")
+                                        continue
+                                    else:
+                                        log(f"   📅 Long-term slot {lt_open+1}/{max_lt} ({days_left}d): {market.question[:50]}")
                         except Exception:
                             pass
 
