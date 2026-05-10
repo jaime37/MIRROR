@@ -160,7 +160,7 @@ class AutonomousPipeline:
                             end_dt = dateparser.parse(end_date_str)
                             if end_dt and end_dt.tzinfo is None:
                                 end_dt = end_dt.replace(tzinfo=timezone.utc)
-                            if end_dt and datetime.now(timezone.utc) > end_dt + timedelta(days=2):
+                            if end_dt and datetime.now(timezone.utc) > end_dt + timedelta(hours=4):
                                 log(f"⏰ Market expired on {end_date_str[:10]}: {pos['question'][:50]}")
                                 self.trader.close_position(market_id, pos["current_price"], reason="expired")
                                 trades_closed += 1
