@@ -48,6 +48,8 @@ DEFAULT_SETTINGS = {
     "delay_between_markets": 8,
     "max_days_to_expiry": 60,          # threshold to classify a market as "long-term"
     "long_term_position_ratio": 0.30,  # max 30% of slots reserved for long-term markets
+    "pre_expiry_lock_days": 3,         # auto-close profitable positions within N days of expiry
+    "min_days_to_expiry_entry": 7,     # [logging only] log short-expiry trades for analysis
 }
 
 # Where run logs are stored
@@ -179,6 +181,26 @@ class AutonomousPipeline:
                     except Exception:
                         pass
 
+                    # Pre-expiry profit lock: close profitable positions near expiry
+                    # (council recommendation: Fix #2 — bug fix, not strategy change)
+                    pre_lock_days = self.settings.get("pre_expiry_lock_days", 3)
+                    try:
+                        end_date_str = pos.get("end_date", "")
+                        if end_date_str and pre_lock_days > 0 and pnl_pct > 0:
+                            from dateutil import parser as dateparser
+                            end_dt = dateparser.parse(end_date_str)
+                            if end_dt and end_dt.tzinfo is None:
+                                end_dt = end_dt.replace(tzinfo=timezone.utc)
+                            if end_dt:
+                                days_left = (end_dt - datetime.now(timezone.utc)).days
+                                if days_left <= pre_lock_days:
+                                    log(f"🔒 Pre-expiry lock ({days_left}d left, +{pnl_pct*100:.1f}%): {pos['question'][:50]}")
+                                    self.trader.close_position(market_id, pos["current_price"], reason="pre_expiry_lock")
+                                    trades_closed += 1
+                                    continue
+                    except Exception:
+                        pass
+
                     if pnl_pct >= tp:
                         log(f"✅ TP hit on {pos['question'][:50]} (+{pnl_pct*100:.1f}%) — closing")
                         try:
@@ -279,6 +301,23 @@ class AutonomousPipeline:
                                         continue
                                     else:
                                         log(f"   📅 Long-term slot {lt_open+1}/{max_lt} ({days_left}d): {market.question[:50]}")
+                        except Exception:
+                            pass
+
+                    # [LOGGING ONLY] Short-expiry market tracker — council Fix #1 experiment.
+                    # We log these trades but do NOT block them yet.
+                    # After 50-100 trades we'll analyse if <7d markets underperform.
+                    min_entry_days = self.settings.get("min_days_to_expiry_entry", 7)
+                    if min_entry_days and market.end_date:
+                        try:
+                            from dateutil import parser as dateparser
+                            end_dt = dateparser.parse(market.end_date)
+                            if end_dt and end_dt.tzinfo is None:
+                                end_dt = end_dt.replace(tzinfo=timezone.utc)
+                            if end_dt:
+                                days_left = (end_dt - datetime.now(timezone.utc)).days
+                                if days_left < min_entry_days:
+                                    log(f"   📊 [short-expiry log] {days_left}d to expiry (threshold={min_entry_days}d): {market.question[:50]}")
                         except Exception:
                             pass
 
