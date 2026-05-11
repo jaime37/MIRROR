@@ -33,7 +33,7 @@ logger = get_logger("mirofish.polymarket.autonomous")
 DEFAULT_SETTINGS = {
     "max_markets_per_cycle": 10,
     "position_size_usdc": 200.0,
-    "min_edge": 0.07,
+    "min_edge": 0.10,              # raised from 0.07 — council Tier 1: stronger signal
     "min_confidence": ["high", "medium"],   # skip low-confidence trades
     "take_profit": 0.20,
     "stop_loss": -0.15,
@@ -41,7 +41,16 @@ DEFAULT_SETTINGS = {
     "max_open_positions": 5,
     "min_volume": 5000,
     "min_liquidity": 1000,
-    "min_entry_price": 0.05,       # skip penny markets (< 5% probability)
+    "min_entry_price": 0.15,       # raised from 0.05 — council Tier 1: avoid lottery tickets
+    "excluded_market_keywords": [  # council Tier 1: skip sports (hyper-efficient, no LLM edge)
+        "nba", "nfl", "nhl", "mlb", "mls",
+        "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "champions league",
+        "world cup", "euro ", "copa", "league cup",
+        "super bowl", "stanley cup", "world series",
+        "match", "vs.", " vs ", "game 1", "game 2", "game 3", "game 4", "game 5", "game 6", "game 7",
+        "o/u ", "over/under", "spread",
+        "lpl ", "lck ", "esports", "esport",
+    ],
     "stoploss_cooldown_days": 7,   # don't re-enter a market for 7 days after stop-loss
     "takeprofit_cooldown_days": 3, # don't re-enter a market for 3 days after take-profit
     "auto_close": True,
@@ -259,12 +268,23 @@ class AutonomousPipeline:
                         except Exception:
                             pass
 
+                # Pre-build excluded keywords list (lower-cased once per cycle)
+                excluded_kw = [kw.lower() for kw in self.settings.get("excluded_market_keywords", [])]
+
                 for market in markets:
                     if market.id in open_pos:
                         continue
                     if market.id in cooled_ids:
                         log(f"   ⏳ Skipping {market.question[:50]} — recently closed cooldown")
                         continue
+
+                    # Council Tier 1: skip sports/hyper-efficient markets
+                    if excluded_kw:
+                        q_lower = market.question.lower()
+                        hit = next((kw for kw in excluded_kw if kw in q_lower), None)
+                        if hit:
+                            log(f"   🚫 Sports/excluded keyword '{hit}': {market.question[:50]}")
+                            continue
                     if len(self.db.get_portfolio().get("positions", {})) >= max_pos:
                         log("Max positions reached mid-cycle — stopping")
                         break
@@ -324,7 +344,7 @@ class AutonomousPipeline:
                     # Skip markets where the lower-probability side is below min_entry_price.
                     # In a binary market YES+NO≈1, so if min(yes,no) < 0.05 it means
                     # one outcome is < 5% — betting on it is a lottery ticket.
-                    min_price = self.settings.get("min_entry_price", 0.05)
+                    min_price = self.settings.get("min_entry_price", 0.15)
                     if min(market.yes_price, market.no_price) < min_price:
                         log(f"   💸 Skipping penny market: {market.question[:50]} "
                             f"(yes={market.yes_price:.4f} no={market.no_price:.4f})")
