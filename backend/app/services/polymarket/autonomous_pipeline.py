@@ -78,8 +78,27 @@ def load_settings() -> dict:
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
-        return {**DEFAULT_SETTINGS, **saved}
-    return DEFAULT_SETTINGS.copy()
+        merged = {**DEFAULT_SETTINGS, **saved}
+    else:
+        merged = DEFAULT_SETTINGS.copy()
+
+    # ── Hard floor: saved settings (e.g. from old UI) can never go BELOW these ──
+    # This ensures code-level upgrades take effect even when bot_settings.json
+    # has stale values from a previous deploy.
+    FLOOR = {
+        "min_entry_price": 0.15,   # council Tier 1 — never below 15%
+        "min_edge": 0.10,          # council Tier 1 — never below 10%
+    }
+    for key, floor_val in FLOOR.items():
+        if merged.get(key, 0) < floor_val:
+            merged[key] = floor_val
+
+    # ── Additive defaults: list settings not present in saved file get defaults ──
+    for key in ("excluded_market_keywords",):
+        if key not in merged or not merged[key]:
+            merged[key] = DEFAULT_SETTINGS.get(key, [])
+
+    return merged
 
 
 def save_settings(settings: dict):
