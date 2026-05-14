@@ -59,6 +59,8 @@ DEFAULT_SETTINGS = {
     "long_term_position_ratio": 0.30,  # max 30% of slots reserved for long-term markets
     "pre_expiry_lock_days": 3,         # auto-close profitable positions within N days of expiry
     "min_days_to_expiry_entry": 7,     # [logging only] log short-expiry trades for analysis
+    "stale_position_days": 5,          # council Tier 2: close if open > N days with no movement
+    "stale_position_movement": 0.03,   # council Tier 2: "no movement" = price moved < 3% from entry
 }
 
 # Where run logs are stored
@@ -224,6 +226,26 @@ class AutonomousPipeline:
                                 if days_left <= pre_lock_days:
                                     log(f"🔒 Pre-expiry lock ({days_left}d left, +{pnl_pct*100:.1f}%): {pos['question'][:50]}")
                                     self.trader.close_position(market_id, pos["current_price"], reason="pre_expiry_lock")
+                                    trades_closed += 1
+                                    continue
+                    except Exception:
+                        pass
+
+                    # Council Tier 2: stale trade auto-close
+                    # If price hasn't moved ±N% in M days → free capital for better trades
+                    stale_days = self.settings.get("stale_position_days", 5)
+                    stale_move = self.settings.get("stale_position_movement", 0.03)
+                    try:
+                        opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
+                        days_open = (datetime.now(timezone.utc) - opened_at).days
+                        if days_open >= stale_days:
+                            entry_p = pos.get("entry_price", pos.get("current_price", 0))
+                            curr_p = pos.get("current_price", entry_p)
+                            if entry_p > 0:
+                                movement = abs(curr_p - entry_p) / entry_p
+                                if movement < stale_move:
+                                    log(f"💤 Stale trade ({days_open}d, {movement*100:.1f}% move) — freeing capital: {pos['question'][:50]}")
+                                    self.trader.close_position(market_id, curr_p, reason="stale")
                                     trades_closed += 1
                                     continue
                     except Exception:
