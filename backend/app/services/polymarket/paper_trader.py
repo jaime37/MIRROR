@@ -3,6 +3,7 @@ Paper trading engine. Simulates order execution at real Polymarket prices
 without spending real money.
 """
 
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 from .portfolio_db import PortfolioDatabase
@@ -11,6 +12,11 @@ from ...utils.logger import get_logger
 logger = get_logger("mirofish.polymarket.paper_trader")
 
 FEE_RATE = 0.02  # 2% simulated fee per trade
+
+# Module-level lock: ensures open/close operations are serialized across threads.
+# Prevents duplicate CLOSE records when the background bot and a manual trigger
+# run concurrently, or when two Railway processes start before the debounce fires.
+_position_lock = threading.Lock()
 
 
 class PaperTrader:
@@ -32,6 +38,29 @@ class PaperTrader:
         end_date: Optional[str] = None,
     ) -> dict:
         """Opens a new paper position. Returns the trade record."""
+        with _position_lock:
+            return self._open_position_locked(
+                market_id, question, side, entry_price, amount_usdc,
+                estimated_prob, confidence, reasoning,
+                simulation_id, report_id, end_date,
+            )
+
+    def _open_position_locked(
+        self,
+        market_id: str,
+        question: str,
+        side: str,
+        entry_price: float,
+        amount_usdc: float,
+        estimated_prob: float,
+        confidence: str,
+        reasoning: str,
+        simulation_id: Optional[str] = None,
+        report_id: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> dict:
+        """Internal: caller must hold _position_lock."""
+        # Re-read from disk inside the lock so we see the latest state
         portfolio = self.db.get_portfolio()
 
         if amount_usdc > portfolio["balance"]:
@@ -102,6 +131,18 @@ class PaperTrader:
         reason: str = "manual",
     ) -> dict:
         """Closes an open paper position at the given exit price."""
+        with _position_lock:
+            return self._close_position_locked(market_id, exit_price, reason)
+
+    def _close_position_locked(
+        self,
+        market_id: str,
+        exit_price: float,
+        reason: str = "manual",
+    ) -> dict:
+        """Internal: caller must hold _position_lock."""
+        # Re-read from disk inside the lock — another thread may have already
+        # closed this position since the caller last checked.
         portfolio = self.db.get_portfolio()
 
         if market_id not in portfolio["positions"]:
@@ -111,6 +152,14 @@ class PaperTrader:
         fee = pos["shares"] * exit_price * FEE_RATE
         proceeds = pos["shares"] * exit_price - fee
         pnl = proceeds - pos["cost_basis"]
+
+        # Remove position and update balance BEFORE writing the trade record.
+        # This ordering ensures that if the process crashes between the two writes,
+        # the position is gone from the portfolio (so it won't be double-closed on
+        # the next restart) even if the CLOSE trade record is missing.
+        portfolio["balance"] = round(portfolio["balance"] + proceeds, 4)
+        del portfolio["positions"][market_id]
+        self.db.save_portfolio(portfolio)
 
         trade = self.db.add_trade({
             "type": "CLOSE",
@@ -127,10 +176,6 @@ class PaperTrader:
             "reason": reason,
             "opened_at": pos["opened_at"],
         })
-
-        portfolio["balance"] = round(portfolio["balance"] + proceeds, 4)
-        del portfolio["positions"][market_id]
-        self.db.save_portfolio(portfolio)
 
         self._snapshot_equity()
         logger.info(
