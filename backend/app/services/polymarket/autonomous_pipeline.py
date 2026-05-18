@@ -36,7 +36,9 @@ DEFAULT_SETTINGS = {
     "min_edge": 0.10,              # raised from 0.07 — council Tier 1: stronger signal
     "min_confidence": ["high", "medium"],   # skip low-confidence trades
     "take_profit": 0.20,
-    "stop_loss": -0.15,
+    "stop_loss": -0.15,            # base SL; actual SL is tiered by entry price (see run_cycle)
+    "stop_loss_low_entry": -0.20,  # Tier 2: entry < 30% → more room (volatile markets)
+    "stop_loss_high_entry": -0.10, # Tier 2: entry > 70% → tighter (near-certain markets)
     "cycle_interval_minutes": 30,
     "max_open_positions": 5,
     "min_volume": 5000,
@@ -57,10 +59,15 @@ DEFAULT_SETTINGS = {
     "delay_between_markets": 8,
     "max_days_to_expiry": 60,          # threshold to classify a market as "long-term"
     "long_term_position_ratio": 0.30,  # max 30% of slots reserved for long-term markets
-    "pre_expiry_lock_days": 3,         # auto-close profitable positions within N days of expiry
-    "min_days_to_expiry_entry": 7,     # [logging only] log short-expiry trades for analysis
+    "pre_expiry_lock_days": 5,         # Tier 2: raised 3→5 — protect profits earlier before expiry
+    "min_days_to_expiry_entry": 7,     # Tier 2: hard block — skip markets expiring in < N days
     "stale_position_days": 5,          # council Tier 2: close if open > N days with no movement
     "stale_position_movement": 0.03,   # council Tier 2: "no movement" = price moved < 3% from entry
+    # Tier 2: dynamic position sizing multipliers (applied to position_size_usdc)
+    "size_multiplier_high_conf_large_edge": 1.25,  # high confidence + edge ≥ 20%
+    "size_multiplier_high_conf_base": 1.00,        # high confidence + edge 10-20%
+    "size_multiplier_medium_conf_large_edge": 0.85,# medium confidence + edge ≥ 20%
+    "size_multiplier_medium_conf_base": 0.70,      # medium confidence + edge 10-20%
 }
 
 # Where run logs are stored
@@ -88,8 +95,10 @@ def load_settings() -> dict:
     # This ensures code-level upgrades take effect even when bot_settings.json
     # has stale values from a previous deploy.
     FLOOR = {
-        "min_entry_price": 0.15,   # council Tier 1 — never below 15%
-        "min_edge": 0.10,          # council Tier 1 — never below 10%
+        "min_entry_price": 0.15,          # council Tier 1 — never below 15%
+        "min_edge": 0.10,                 # council Tier 1 — never below 10%
+        "min_days_to_expiry_entry": 7,    # Tier 2 — hard block, never disable
+        "pre_expiry_lock_days": 5,        # Tier 2 — protect profits, never below 5d
     }
     for key, floor_val in FLOOR.items():
         if merged.get(key, 0) < floor_val:
@@ -182,7 +191,17 @@ class AutonomousPipeline:
                 for market_id, pos in list(open_pos.items()):
                     pnl_pct = (pos.get("current_value", pos["cost_basis"]) - pos["cost_basis"]) / pos["cost_basis"]
                     tp = self.settings.get("take_profit", 0.20)
-                    sl = self.settings.get("stop_loss", -0.15)
+                    # Tier 2: tiered stop-loss by entry price
+                    # - Low entry (<30%): wider SL — volatile markets need more room
+                    # - High entry (>70%): tighter SL — near-certain markets shouldn't swing much
+                    # - Mid range: standard SL
+                    entry_p = pos.get("entry_price", 0.5)
+                    if entry_p < 0.30:
+                        sl = self.settings.get("stop_loss_low_entry", -0.20)
+                    elif entry_p > 0.70:
+                        sl = self.settings.get("stop_loss_high_entry", -0.10)
+                    else:
+                        sl = self.settings.get("stop_loss", -0.15)
 
                     # Auto-close if market end_date has passed (+ 2 day grace period)
                     try:
@@ -365,9 +384,9 @@ class AutonomousPipeline:
                         except Exception:
                             pass
 
-                    # [LOGGING ONLY] Short-expiry market tracker — council Fix #1 experiment.
-                    # We log these trades but do NOT block them yet.
-                    # After 50-100 trades we'll analyse if <7d markets underperform.
+                    # Tier 2: hard block on short-expiry markets.
+                    # Near-expiry markets are already priced by the crowd — LLM has no edge.
+                    # Markets without an end_date are allowed through (open-ended questions).
                     min_entry_days = self.settings.get("min_days_to_expiry_entry", 7)
                     if min_entry_days and market.end_date:
                         try:
@@ -378,7 +397,8 @@ class AutonomousPipeline:
                             if end_dt:
                                 days_left = (end_dt - datetime.now(timezone.utc)).days
                                 if days_left < min_entry_days:
-                                    log(f"   📊 [short-expiry log] {days_left}d to expiry (threshold={min_entry_days}d): {market.question[:50]}")
+                                    log(f"   📅 Skipping short-expiry {days_left}d (min={min_entry_days}d): {market.question[:50]}")
+                                    continue
                         except Exception:
                             pass
 
@@ -441,7 +461,23 @@ class AutonomousPipeline:
 
                     try:
                         bal = self.db.get_portfolio().get("balance", 0)
-                        size = min(self.settings.get("position_size_usdc", 200), bal)
+                        # Tier 2: dynamic position sizing by confidence + edge strength
+                        base_size = self.settings.get("position_size_usdc", 200)
+                        edge_strength = abs(edge)
+                        if confidence == "high":
+                            if edge_strength >= 0.20:
+                                multiplier = self.settings.get("size_multiplier_high_conf_large_edge", 1.25)
+                            else:
+                                multiplier = self.settings.get("size_multiplier_high_conf_base", 1.00)
+                        elif confidence == "medium":
+                            if edge_strength >= 0.20:
+                                multiplier = self.settings.get("size_multiplier_medium_conf_large_edge", 0.85)
+                            else:
+                                multiplier = self.settings.get("size_multiplier_medium_conf_base", 0.70)
+                        else:
+                            multiplier = 1.0
+                        dynamic_size = round(base_size * multiplier)
+                        size = min(dynamic_size, bal)
                         self.trader.open_position(
                             market_id=market.id,
                             question=market.question,
@@ -454,7 +490,9 @@ class AutonomousPipeline:
                             end_date=market.end_date,
                         )
                         trades_opened += 1
-                        log(f"   💰 Position opened: {side} ${size:.0f} @ {entry_price:.4f}")
+                        # Update in-memory open_pos to prevent re-entry in same cycle
+                        open_pos[market.id] = {"entry_price": entry_price}
+                        log(f"   💰 Position opened: {side} ${size:.0f} (x{multiplier:.2f}) @ {entry_price:.4f}")
                     except Exception as e:
                         log(f"   Trade error: {e}", "error")
                         errors += 1
