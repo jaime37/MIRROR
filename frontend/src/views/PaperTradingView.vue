@@ -374,7 +374,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { polymarketApi } from '../api/polymarket'
 
 // ── State ──────────────────────────────────────────────────
@@ -430,7 +430,21 @@ const filteredEquity = computed(() => {
 })
 
 // ── Lifecycle ──────────────────────────────────────────────
-onMounted(async () => { await Promise.all([refreshAll(), loadBotStatus()]) })
+let _autoRefreshTimer = null
+
+onMounted(async () => {
+  await Promise.all([refreshAll(), loadBotStatus()])
+  // Auto-refresh every 60 s so the dashboard always shows live data
+  // without the user having to click Refresh manually
+  _autoRefreshTimer = setInterval(async () => {
+    await Promise.all([loadPortfolio(), loadTrades(), loadBotStatus()])
+  }, 60_000)
+})
+
+onUnmounted(() => {
+  if (_autoRefreshTimer) clearInterval(_autoRefreshTimer)
+})
+
 watch(filteredEquity, () => nextTick(drawChart))
 
 // ── Data loading ────────────────────────────────────────────

@@ -100,7 +100,18 @@ class PortfolioDatabase:
     def get_stats(self) -> dict:
         trades = self.get_trades()
         portfolio = self.get_portfolio()
-        closed = [t for t in trades if t.get("type") == "CLOSE"]
+
+        # Deduplicate CLOSE records: a race condition bug (pre-fix commit 408a528) could
+        # write multiple CLOSE records for the same position. For stats purposes, keep
+        # only the FIRST close per market_id (earliest timestamp = the real close).
+        seen_market_ids: dict = {}
+        for t in trades:
+            if t.get("type") == "CLOSE":
+                mid = t.get("market_id", "")
+                ts = t.get("timestamp", "")
+                if mid not in seen_market_ids or ts < seen_market_ids[mid]["timestamp"]:
+                    seen_market_ids[mid] = t
+        closed = list(seen_market_ids.values())
 
         wins = [t for t in closed if t.get("pnl", 0) > 0]
         losses = [t for t in closed if t.get("pnl", 0) <= 0]
