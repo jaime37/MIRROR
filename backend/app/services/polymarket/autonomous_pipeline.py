@@ -104,6 +104,17 @@ def load_settings() -> dict:
         if merged.get(key, 0) < floor_val:
             merged[key] = floor_val
 
+    # ── Hard overrides: these values always come from code, never from saved file ──
+    # Critical for strategy pivots — prevents stale bot_settings.json from
+    # overriding new defaults after a deploy.
+    HARDCODE = {
+        "position_size_usdc": 400.0,
+        "max_days_to_expiry": 30,
+        "min_entry_price": 0.05,
+    }
+    for key, val in HARDCODE.items():
+        merged[key] = val
+
     # ── Additive defaults: list settings not present in saved file get defaults ──
     for key in ("excluded_market_keywords",):
         if key not in merged or not merged[key]:
