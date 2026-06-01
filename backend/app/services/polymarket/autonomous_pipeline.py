@@ -32,7 +32,7 @@ logger = get_logger("mirofish.polymarket.autonomous")
 # ── Default settings ──────────────────────────────────────────────────────────
 DEFAULT_SETTINGS = {
     "max_markets_per_cycle": 10,
-    "position_size_usdc": 200.0,
+    "position_size_usdc": 400.0,
     "min_edge": 0.10,              # raised from 0.07 — council Tier 1: stronger signal
     "min_confidence": ["high", "medium"],   # skip low-confidence trades
     "take_profit": 0.20,
@@ -43,7 +43,7 @@ DEFAULT_SETTINGS = {
     "max_open_positions": 5,
     "min_volume": 5000,
     "min_liquidity": 1000,
-    "min_entry_price": 0.15,       # raised from 0.05 — council Tier 1: avoid lottery tickets
+    "min_entry_price": 0.05,       # lowered for extreme contrarian entries
     "excluded_market_keywords": [  # council Tier 1: skip sports (hyper-efficient, no LLM edge)
         "nba", "nfl", "nhl", "mlb", "mls",
         "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "champions league",
@@ -57,7 +57,7 @@ DEFAULT_SETTINGS = {
     "takeprofit_cooldown_days": 3, # don't re-enter a market for 3 days after take-profit
     "auto_close": True,
     "delay_between_markets": 8,
-    "max_days_to_expiry": 60,          # threshold to classify a market as "long-term"
+    "max_days_to_expiry": 30,          # threshold to classify a market as "long-term"
     "long_term_position_ratio": 0.30,  # max 30% of slots reserved for long-term markets
     "pre_expiry_lock_days": 5,         # Tier 2: raised 3→5 — protect profits earlier before expiry
     "min_days_to_expiry_entry": 7,     # Tier 2: hard block — skip markets expiring in < N days
@@ -95,7 +95,7 @@ def load_settings() -> dict:
     # This ensures code-level upgrades take effect even when bot_settings.json
     # has stale values from a previous deploy.
     FLOOR = {
-        "min_entry_price": 0.15,          # council Tier 1 — never below 15%
+        "min_entry_price": 0.05,          # contrarian strategy — allow extreme entries
         "min_edge": 0.10,                 # council Tier 1 — never below 10%
         "min_days_to_expiry_entry": 7,    # Tier 2 — hard block, never disable
         "pre_expiry_lock_days": 5,        # Tier 2 — protect profits, never below 5d
@@ -158,6 +158,57 @@ class AutonomousPipeline:
         self.trader = PaperTrader()
         self.db = PortfolioDatabase()
 
+    def _detect_disruption(self, question: str, yes_price: float, no_price: float) -> tuple[bool, list[str]]:
+        """
+        Searches for recent news and asks the LLM whether there's a disruption
+        that invalidates the current extreme consensus.
+        Returns (disruption_detected, news_headlines)
+        """
+        query = f"{question[:100].strip()} 2025"
+        try:
+            snippets = self.researcher._search(query, 5)
+        except Exception as e:
+            logger.warning(f"News search failed: {e}")
+            snippets = []
+
+        news_summary = []
+        for s in snippets[:5]:
+            title = s.get("title", "")
+            if title:
+                news_summary.append(f"- {title}")
+
+        news_text = "\n".join(news_summary) if news_summary else "No recent news found."
+
+        llm_prompt = f"""Market: {question}
+Current market price: YES at {yes_price:.1%}, NO at {no_price:.1%}
+
+Recent news headlines:
+{news_text}
+
+Task: Determine if there is a STRONG DISRUPTIVE event in the last 48 hours that would invalidate the current extreme market consensus.
+- If YES > 85% and market assumes certainty: Is there NEW evidence that makes the NO outcome likely?
+- If NO > 85% and market assumes certainty: Is there NEW evidence that makes the YES outcome likely?
+
+Respond ONLY with one of:
+- "DISRUPTION: YES" (news strongly favor the underdog / contradict consensus)
+- "DISRUPTION: NO" (news strongly favor the favorite / maintain consensus)
+- "NO DISRUPTION" (no significant new information)
+
+Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning.
+"""
+        try:
+            raw = self.researcher.llm.chat(
+                [{"role": "user", "content": llm_prompt}],
+                temperature=0.2,
+                max_tokens=100,
+            )
+            llm_response = raw.strip().upper()
+            disruption = "DISRUPTION: YES" in llm_response
+            return disruption, news_summary
+        except Exception as e:
+            logger.warning(f"LLM disruption check failed: {e}")
+            return False, news_summary
+
     def run_cycle(self) -> dict:
         """
         Executes one full bot cycle. Returns a run summary dict.
@@ -196,10 +247,10 @@ class AutonomousPipeline:
                     # - High entry (>70%): tighter SL — near-certain markets shouldn't swing much
                     # - Mid range: standard SL
                     entry_p = pos.get("entry_price", 0.5)
-                    if entry_p < 0.30:
-                        sl = self.settings.get("stop_loss_low_entry", -0.20)
-                    elif entry_p > 0.70:
-                        sl = self.settings.get("stop_loss_high_entry", -0.10)
+                    if entry_p < 0.10 or entry_p > 0.90:
+                        sl = -0.25
+                    elif entry_p < 0.20 or entry_p > 0.80:
+                        sl = -0.20
                     else:
                         sl = self.settings.get("stop_loss", -0.15)
 
@@ -250,25 +301,26 @@ class AutonomousPipeline:
                     except Exception:
                         pass
 
-                    # Council Tier 2: stale trade auto-close
-                    # If price hasn't moved ±N% in M days → free capital for better trades
-                    stale_days = self.settings.get("stale_position_days", 5)
-                    stale_move = self.settings.get("stale_position_movement", 0.03)
-                    try:
-                        opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
-                        days_open = (datetime.now(timezone.utc) - opened_at).days
-                        if days_open >= stale_days:
-                            entry_p = pos.get("entry_price", pos.get("current_price", 0))
-                            curr_p = pos.get("current_price", entry_p)
-                            if entry_p > 0:
-                                movement = abs(curr_p - entry_p) / entry_p
-                                if movement < stale_move:
-                                    log(f"💤 Stale trade ({days_open}d, {movement*100:.1f}% move) — freeing capital: {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, curr_p, reason="stale")
-                                    trades_closed += 1
-                                    continue
-                    except Exception:
-                        pass
+                    # === STALE CLOSE — DESHABILITADO para estrategia contrarian ===
+                    # Las posiciones en extremos necesitan tiempo para revertir.
+                    # No cerrar por falta de movimiento.
+                    # stale_days = self.settings.get("stale_position_days", 5)
+                    # stale_move = self.settings.get("stale_position_movement", 0.03)
+                    # try:
+                    #     opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
+                    #     days_open = (datetime.now(timezone.utc) - opened_at).days
+                    #     if days_open >= stale_days:
+                    #         entry_p = pos.get("entry_price", pos.get("current_price", 0))
+                    #         curr_p = pos.get("current_price", entry_p)
+                    #         if entry_p > 0:
+                    #             movement = abs(curr_p - entry_p) / entry_p
+                    #             if movement < stale_move:
+                    #                 log(f"💤 Stale trade ({days_open}d, {movement*100:.1f}% move) — freeing capital: {pos['question'][:50]}")
+                    #                 self.trader.close_position(market_id, curr_p, reason="stale")
+                    #                 trades_closed += 1
+                    #                 continue
+                    # except Exception:
+                    #     pass
 
                     if pnl_pct >= tp:
                         log(f"✅ TP hit on {pos['question'][:50]} (+{pnl_pct*100:.1f}%) — closing")
@@ -402,13 +454,10 @@ class AutonomousPipeline:
                         except Exception:
                             pass
 
-                    # Skip markets where the lower-probability side is below min_entry_price.
-                    # In a binary market YES+NO≈1, so if min(yes,no) < 0.05 it means
-                    # one outcome is < 5% — betting on it is a lottery ticket.
-                    min_price = self.settings.get("min_entry_price", 0.15)
-                    if min(market.yes_price, market.no_price) < min_price:
-                        log(f"   💸 Skipping penny market: {market.question[:50]} "
-                            f"(yes={market.yes_price:.4f} no={market.no_price:.4f})")
+                    # === NUEVO: Filtro de extremos (contrarian) ===
+                    # Si ambos lados están entre 15% y 85%, SKIP. No hay edge contrarian.
+                    if (0.15 < market.yes_price < 0.85) and (0.15 < market.no_price < 0.85):
+                        log(f"   ⏭️ Skip middle range (YES={market.yes_price:.2%}, NO={market.no_price:.2%}) — no contrarian edge")
                         continue
 
                     log(f"🔍 Researching: {market.question[:60]}…")
@@ -417,66 +466,128 @@ class AutonomousPipeline:
                     if delay_s > 0:
                         time.sleep(delay_s)
                     try:
-                        signal = self.researcher.research(market.question)
+                        disruption, news_summary = self._detect_disruption(
+                            market.question, market.yes_price, market.no_price
+                        )
                     except Exception as e:
-                        log(f"Research error: {e}", "warning")
+                        log(f"Disruption detection error: {e}", "warning")
                         errors += 1
                         continue
 
-                    prob = signal.get("probability")
-                    confidence = signal.get("confidence", "irrelevant")
-                    relevant = signal.get("relevant", False)
+                    # === NUEVA LÓGICA DE DECISIÓN (contrarian pura) ===
+                    side = None
+                    entry_price = None
+                    confidence = None
+                    edge = 0.0
 
-                    reasoning_short = signal.get("reasoning", "")[:80]
-                    if not relevant or prob is None:
-                        log(f"   → Irrelevant: {reasoning_short}")
+                    if market.yes_price > 0.85 and not disruption:
+                        side = "NO"
+                        entry_price = market.no_price
+                        confidence = "high"
+                        edge = market.yes_price - 0.85
+                    elif market.no_price > 0.85 and not disruption:
+                        side = "YES"
+                        entry_price = market.yes_price
+                        confidence = "high"
+                        edge = market.no_price - 0.85
+                    elif disruption:
+                        log(f"   ⚠️ Disruption detected — market may be adjusting, skip")
+                        logger.info(json.dumps({
+                            "event": "CONTRARIAN_EVAL",
+                            "market_id": market.id,
+                            "question": market.question[:80],
+                            "yes_price": round(market.yes_price, 4),
+                            "no_price": round(market.no_price, 4),
+                            "side": None,
+                            "disruption": True,
+                            "edge": 0,
+                            "size": 0,
+                            "decision": "SKIP",
+                            "reason": "disruption detected",
+                        }))
+                        continue
+                    else:
+                        log(f"   ⏭️ Not in extreme range — skip")
+                        logger.info(json.dumps({
+                            "event": "CONTRARIAN_EVAL",
+                            "market_id": market.id,
+                            "question": market.question[:80],
+                            "yes_price": round(market.yes_price, 4),
+                            "no_price": round(market.no_price, 4),
+                            "side": None,
+                            "disruption": False,
+                            "edge": 0,
+                            "size": 0,
+                            "decision": "SKIP",
+                            "reason": "not in extreme range",
+                        }))
                         continue
 
-                    log(f"   → prob={prob:.2f} conf={confidence} | {reasoning_short}")
-
-                    if confidence not in self.settings.get("min_confidence", ["high", "medium", "low"]):
-                        log(f"   → Confidence '{confidence}' below threshold — skip")
+                    if edge < 0.05:
+                        log(f"   ⏭️ Edge too small ({edge:.2%}) — skip")
+                        logger.info(json.dumps({
+                            "event": "CONTRARIAN_EVAL",
+                            "market_id": market.id,
+                            "question": market.question[:80],
+                            "yes_price": round(market.yes_price, 4),
+                            "no_price": round(market.no_price, 4),
+                            "side": side,
+                            "disruption": False,
+                            "edge": round(edge, 4),
+                            "size": 0,
+                            "decision": "SKIP",
+                            "reason": "edge too small",
+                        }))
                         continue
-
-                    # edge check
-                    edge = prob - market.yes_price
-                    min_edge = self.settings.get("min_edge", 0.07)
-                    if abs(edge) < min_edge:
-                        log(f"   → No edge (est={prob:.2f} vs mkt={market.yes_price:.2f}, edge={abs(edge):.3f})")
-                        continue
-
-                    side = "YES" if edge > 0 else "NO"
-                    entry_price = market.yes_price if side == "YES" else market.no_price
 
                     # Secondary safety: entry price itself must be above threshold
+                    min_price = self.settings.get("min_entry_price", 0.05)
                     if entry_price < min_price:
                         log(f"   💸 Entry price too low for {side}: {entry_price:.4f} — skip")
+                        logger.info(json.dumps({
+                            "event": "CONTRARIAN_EVAL",
+                            "market_id": market.id,
+                            "question": market.question[:80],
+                            "yes_price": round(market.yes_price, 4),
+                            "no_price": round(market.no_price, 4),
+                            "side": side,
+                            "disruption": False,
+                            "edge": round(edge, 4),
+                            "size": 0,
+                            "decision": "SKIP",
+                            "reason": "entry price below min",
+                        }))
                         continue
 
                     log(
-                        f"   ✅ EDGE FOUND: {side} | est={prob:.2f} mkt={market.yes_price:.2f} "
-                        f"edge={abs(edge):.3f} conf={confidence}"
+                        f"   ✅ CONTRARIAN EDGE: {side} | "
+                        f"extreme={'YES' if market.yes_price > 0.85 else 'NO'} "
+                        f"edge={edge:.3f} disruption={disruption}"
                     )
-                    log(f"   💡 {signal.get('reasoning', '')}")
 
                     try:
                         bal = self.db.get_portfolio().get("balance", 0)
-                        # Tier 2: dynamic position sizing by confidence + edge strength
-                        base_size = self.settings.get("position_size_usdc", 200)
+                        # === NUEVO SIZING ===
+                        base_size = self.settings.get("position_size_usdc", 400.0)
                         edge_strength = abs(edge)
-                        if confidence == "high":
-                            if edge_strength >= 0.20:
-                                multiplier = self.settings.get("size_multiplier_high_conf_large_edge", 1.25)
-                            else:
-                                multiplier = self.settings.get("size_multiplier_high_conf_base", 1.00)
-                        elif confidence == "medium":
-                            if edge_strength >= 0.20:
-                                multiplier = self.settings.get("size_multiplier_medium_conf_large_edge", 0.85)
-                            else:
-                                multiplier = self.settings.get("size_multiplier_medium_conf_base", 0.70)
+                        if edge_strength >= 0.10:
+                            multiplier = 1.5   # $600
+                        elif edge_strength >= 0.05:
+                            multiplier = 1.0   # $400
                         else:
-                            multiplier = 1.0
+                            multiplier = 0.5   # $200 (fallback)
+
                         dynamic_size = round(base_size * multiplier)
+
+                        # CAP: nunca más del 10% del portfolio en una sola posición
+                        portfolio = self.trader.db.get_portfolio()
+                        portfolio_value = portfolio.get("balance", 10000)
+                        max_position = portfolio_value * 0.10
+                        dynamic_size = min(dynamic_size, max_position)
+
+                        # FLOOR: mínimo $300 para que fees no se coman todo
+                        dynamic_size = max(dynamic_size, 300.0)
+
                         size = min(dynamic_size, bal)
                         self.trader.open_position(
                             market_id=market.id,
@@ -484,15 +595,28 @@ class AutonomousPipeline:
                             side=side,
                             entry_price=entry_price,
                             amount_usdc=size,
-                            estimated_prob=prob,
+                            estimated_prob=0.5,  # no longer used meaningfully
                             confidence=confidence,
-                            reasoning=signal.get("reasoning", ""),
+                            reasoning=f"Extreme contrarian: fade {'YES' if market.yes_price > 0.85 else 'NO'} consensus @ {edge:.1%} excess. News: {'; '.join(news_summary[:3])}",
                             end_date=market.end_date,
                         )
                         trades_opened += 1
                         # Update in-memory open_pos to prevent re-entry in same cycle
                         open_pos[market.id] = {"entry_price": entry_price}
                         log(f"   💰 Position opened: {side} ${size:.0f} (x{multiplier:.2f}) @ {entry_price:.4f}")
+                        logger.info(json.dumps({
+                            "event": "CONTRARIAN_EVAL",
+                            "market_id": market.id,
+                            "question": market.question[:80],
+                            "yes_price": round(market.yes_price, 4),
+                            "no_price": round(market.no_price, 4),
+                            "side": side,
+                            "disruption": False,
+                            "edge": round(edge, 4),
+                            "size": size,
+                            "decision": "OPEN",
+                            "reason": "extreme contrarian, no disruption",
+                        }))
                     except Exception as e:
                         log(f"   Trade error: {e}", "error")
                         errors += 1
