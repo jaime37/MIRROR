@@ -2,6 +2,7 @@
 Paper trading API endpoints for Polymarket integration.
 """
 
+import os
 import traceback
 from flask import request, jsonify
 
@@ -11,6 +12,7 @@ from ..services.polymarket.autonomous_pipeline import (
     run_once, start_bot, stop_bot, get_bot_status, get_runs,
     load_settings, save_settings,
 )
+from ..services.polymarket.bot_reporter import BotReporter
 from ..services.report_agent import ReportManager
 from ..utils.logger import get_logger
 logger = get_logger("mirofish.api.polymarket")
@@ -275,4 +277,64 @@ def update_bot_settings():
         save_settings(current)
         return jsonify({"success": True, "data": current})
     except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ── Reports ────────────────────────────────────────────────────────────────────
+
+# Reporter instance using the same data dir as portfolio_db
+from ..services.polymarket.portfolio_db import DATA_DIR as _PT_DATA_DIR
+
+_reporter = BotReporter(_PT_DATA_DIR)
+
+
+@polymarket_bp.route("/report", methods=["GET"])
+def get_latest_report():
+    """Devuelve el último reporte generado automáticamente."""
+    try:
+        report = _reporter.get_latest_report()
+        if not report:
+            return jsonify({"success": False, "error": "No reports generated yet"}), 404
+        return jsonify({"success": True, "data": report})
+    except Exception as e:
+        logger.error(f"get_latest_report error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@polymarket_bp.route("/reports", methods=["GET"])
+def list_reports():
+    """Lista los últimos N reportes generados."""
+    try:
+        limit = request.args.get("limit", 20, type=int)
+        files = _reporter.list_reports(limit=limit)
+        return jsonify({
+            "success": True,
+            "data": {
+                "reports": files,
+                "count": len(files),
+                "latest": files[0] if files else None,
+            }
+        })
+    except Exception as e:
+        logger.error(f"list_reports error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@polymarket_bp.route("/reports/<filename>", methods=["GET"])
+def get_specific_report(filename):
+    """Devuelve un reporte específico por nombre de archivo."""
+    try:
+        # Seguridad: solo permitir filenames que empiecen con report_ y terminen en .json
+        if not filename.startswith("report_") or not filename.endswith(".json"):
+            return jsonify({"success": False, "error": "Invalid filename"}), 400
+
+        filepath = os.path.join(_reporter.reports_dir, filename)
+        if not os.path.exists(filepath):
+            return jsonify({"success": False, "error": "Report not found"}), 404
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return jsonify({"success": True, "data": data})
+    except Exception as e:
+        logger.error(f"get_specific_report error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500

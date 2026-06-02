@@ -25,6 +25,7 @@ from .market_fetcher import MarketFetcher
 from .news_researcher import NewsResearcher
 from .paper_trader import PaperTrader
 from .portfolio_db import PortfolioDatabase
+from .bot_reporter import BotReporter
 from ...utils.logger import get_logger
 
 logger = get_logger("mirofish.polymarket.autonomous")
@@ -168,6 +169,8 @@ class AutonomousPipeline:
         self.researcher = NewsResearcher()
         self.trader = PaperTrader()
         self.db = PortfolioDatabase()
+        self.reporter = BotReporter(LOG_DIR)
+        self._cycle_count = 0
 
     def _detect_disruption(self, question: str, yes_price: float, no_price: float) -> tuple[bool, list[str]]:
         """
@@ -673,6 +676,19 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
         }
         _save_run(run)
         log(f"✅ Cycle done: {trades_opened} opened, {trades_closed} closed, {errors} errors")
+
+        # === Generar reporte automático cada 6 ciclos (~3 horas) ===
+        self._cycle_count += 1
+        if self._cycle_count % 6 == 0:
+            try:
+                report = self.reporter.generate_report()
+                logger.info(f"[REPORT] Generated report at {report['generated_at']} — Status: {report['status']}")
+                if report["alerts"]:
+                    for alert in report["alerts"]:
+                        logger.warning(f"[REPORT ALERT] {alert}")
+            except Exception as e:
+                logger.error(f"[REPORT ERROR] Failed to generate report: {e}")
+
         return run
 
 
