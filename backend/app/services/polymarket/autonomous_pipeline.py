@@ -163,6 +163,10 @@ def get_runs(limit: int = 20) -> list:
 # ── Core cycle ────────────────────────────────────────────────────────────────
 
 class AutonomousPipeline:
+    # Class-level cycle counter so it survives across AutonomousPipeline instances
+    # (the background loop creates a new instance every cycle)
+    _cycle_count = 0
+
     def __init__(self, settings: Optional[dict] = None):
         self.settings = settings or load_settings()
         self.fetcher = MarketFetcher()
@@ -170,7 +174,6 @@ class AutonomousPipeline:
         self.trader = PaperTrader()
         self.db = PortfolioDatabase()
         self.reporter = BotReporter(LOG_DIR)
-        self._cycle_count = 0
 
     def _detect_disruption(self, question: str, yes_price: float, no_price: float) -> tuple[bool, list[str]]:
         """
@@ -678,8 +681,8 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
         log(f"✅ Cycle done: {trades_opened} opened, {trades_closed} closed, {errors} errors")
 
         # === Generar reporte automático cada 6 ciclos (~3 horas) ===
-        self._cycle_count += 1
-        if self._cycle_count % 6 == 0:
+        AutonomousPipeline._cycle_count += 1
+        if AutonomousPipeline._cycle_count % 6 == 0:
             try:
                 report = self.reporter.generate_report()
                 logger.info(f"[REPORT] Generated report at {report['generated_at']} — Status: {report['status']}")
