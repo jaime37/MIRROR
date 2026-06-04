@@ -338,3 +338,14 @@ def get_specific_report(filename):
     except Exception as e:
         logger.error(f"get_specific_report error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@polymarket_bp.route("/report/force", methods=["POST"])
+def force_report():
+    """Fuerza la generación de un reporte manualmente."""
+    try:
+        report = _reporter.generate_report()
+        return jsonify({"success": True, "data": report})
+    except Exception as e:
+        logger.error(f"force_report error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500

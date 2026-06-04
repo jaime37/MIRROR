@@ -44,7 +44,7 @@ DEFAULT_SETTINGS = {
     "max_open_positions": 5,
     "min_volume": 5000,
     "min_liquidity": 1000,
-    "min_entry_price": 0.05,       # lowered for extreme contrarian entries
+    "min_entry_price": 0.01,       # allow extreme contrarian entries (1-15% range)
     "excluded_market_keywords": [  # council Tier 1: skip sports (hyper-efficient, no LLM edge)
         "nba", "nfl", "nhl", "mlb", "mls",
         "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "champions league",
@@ -59,7 +59,7 @@ DEFAULT_SETTINGS = {
     "auto_close": True,
     "delay_between_markets": 8,
     "max_days_to_expiry": 30,          # threshold to classify a market as "long-term"
-    "long_term_position_ratio": 0.30,  # max 30% of slots reserved for long-term markets
+    "long_term_position_ratio": 0.40,  # max 40% of slots reserved for long-term markets
     "pre_expiry_lock_days": 5,         # Tier 2: raised 3→5 — protect profits earlier before expiry
     "min_days_to_expiry_entry": 7,     # Tier 2: hard block — skip markets expiring in < N days
     "stale_position_days": 5,          # council Tier 2: close if open > N days with no movement
@@ -96,7 +96,7 @@ def load_settings() -> dict:
     # This ensures code-level upgrades take effect even when bot_settings.json
     # has stale values from a previous deploy.
     FLOOR = {
-        "min_entry_price": 0.05,          # contrarian strategy — allow extreme entries
+        "min_entry_price": 0.01,          # contrarian strategy — allow extreme entries < 5%
         "min_edge": 0.10,                 # council Tier 1 — never below 10%
         "min_days_to_expiry_entry": 7,    # Tier 2 — hard block, never disable
         "pre_expiry_lock_days": 5,        # Tier 2 — protect profits, never below 5d
@@ -111,7 +111,7 @@ def load_settings() -> dict:
     HARDCODE = {
         "position_size_usdc": 400.0,
         "max_days_to_expiry": 30,
-        "min_entry_price": 0.05,
+        "min_entry_price": 0.01,
     }
     for key, val in HARDCODE.items():
         merged[key] = val
