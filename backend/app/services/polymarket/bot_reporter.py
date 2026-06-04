@@ -38,7 +38,10 @@ class BotReporter:
         positions = portfolio.get("positions", {})
         total_value = portfolio.get("total_value", balance)
         open_count = len(positions)
-        stats = portfolio.get("stats", {})
+
+        # Calcular stats desde trades (portfolio.json no tiene campo stats)
+        from .portfolio_db import PortfolioDatabase
+        stats = PortfolioDatabase().get_stats()
 
         # Trades recientes (últimas 48h)
         cutoff = datetime.now(timezone.utc).timestamp() - (48 * 3600)
