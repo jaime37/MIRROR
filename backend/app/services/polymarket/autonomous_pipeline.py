@@ -33,19 +33,19 @@ logger = get_logger("mirofish.polymarket.autonomous")
 # ── Default settings ──────────────────────────────────────────────────────────
 DEFAULT_SETTINGS = {
     "max_markets_per_cycle": 10,
-    "position_size_usdc": 400.0,
-    "min_edge": 0.10,              # raised from 0.07 — council Tier 1: stronger signal
-    "min_confidence": ["high", "medium"],   # skip low-confidence trades
+    "position_size_usdc": 200.0,       # REDUCED: 400→200 — protect damaged portfolio
+    "min_edge": 0.10,                  # council Tier 1: stronger signal
+    "min_confidence": ["high", "medium"],
     "take_profit": 0.20,
-    "stop_loss": -0.15,            # base SL; actual SL is tiered by entry price (see run_cycle)
-    "stop_loss_low_entry": -0.20,  # Tier 2: entry < 30% → more room (volatile markets)
-    "stop_loss_high_entry": -0.10, # Tier 2: entry > 70% → tighter (near-certain markets)
+    "stop_loss": -0.15,                # base SL; actual SL is tiered by entry price
+    "stop_loss_low_entry": -0.20,      # entry < 30%
+    "stop_loss_high_entry": -0.10,     # entry > 70%
     "cycle_interval_minutes": 30,
     "max_open_positions": 5,
     "min_volume": 5000,
     "min_liquidity": 1000,
-    "min_entry_price": 0.01,       # allow extreme contrarian entries (1-15% range)
-    "excluded_market_keywords": [  # council Tier 1: skip sports (hyper-efficient, no LLM edge)
+    "min_entry_price": 0.01,           # allow extreme contrarian entries (1-15% range)
+    "excluded_market_keywords": [
         "nba", "nfl", "nhl", "mlb", "mls",
         "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "champions league",
         "world cup", "euro ", "copa", "league cup",
@@ -54,21 +54,31 @@ DEFAULT_SETTINGS = {
         "o/u ", "over/under", "spread",
         "lpl ", "lck ", "esports", "esport",
     ],
-    "stoploss_cooldown_days": 7,   # don't re-enter a market for 7 days after stop-loss
-    "takeprofit_cooldown_days": 3, # don't re-enter a market for 3 days after take-profit
+    "stoploss_cooldown_days": 7,
+    "takeprofit_cooldown_days": 3,
     "auto_close": True,
     "delay_between_markets": 8,
-    "max_days_to_expiry": 30,          # threshold to classify a market as "long-term"
-    "long_term_position_ratio": 0.40,  # max 40% of slots reserved for long-term markets
-    "pre_expiry_lock_days": 5,         # Tier 2: raised 3→5 — protect profits earlier before expiry
-    "min_days_to_expiry_entry": 7,     # Tier 2: hard block — skip markets expiring in < N days
-    "stale_position_days": 5,          # council Tier 2: close if open > N days with no movement
-    "stale_position_movement": 0.03,   # council Tier 2: "no movement" = price moved < 3% from entry
-    # Tier 2: dynamic position sizing multipliers (applied to position_size_usdc)
-    "size_multiplier_high_conf_large_edge": 1.25,  # high confidence + edge ≥ 20%
-    "size_multiplier_high_conf_base": 1.00,        # high confidence + edge 10-20%
-    "size_multiplier_medium_conf_large_edge": 0.85,# medium confidence + edge ≥ 20%
-    "size_multiplier_medium_conf_base": 0.70,      # medium confidence + edge 10-20%
+    "max_days_to_expiry": 30,
+    "long_term_position_ratio": 0.40,
+    "pre_expiry_lock_days": 5,
+    "min_days_to_expiry_entry": 7,
+    "stale_position_days": 7,          # RE-ENABLED: 5→7d — contrarian needs time, but not forever
+    "stale_position_movement": 0.03,
+    # Tier 2: dynamic position sizing multipliers
+    "size_multiplier_high_conf_large_edge": 1.00,  # high conf + edge ≥20% → $200
+    "size_multiplier_high_conf_base": 0.75,        # high conf + edge 10-20% → $150
+    "size_multiplier_medium_conf_large_edge": 0.75,# medium conf + edge ≥20% → $150
+    "size_multiplier_medium_conf_base": 0.50,      # medium conf + edge 10-20% → $100
+    # ── RISK MANAGEMENT v3 ──
+    "max_portfolio_risk_pct": 0.15,    # max 15% of portfolio at risk across open positions
+    "max_drawdown_pause_pct": 0.20,    # pause new entries if drawdown >20%
+    "drawdown_reduce_sizing_pct": 0.10,# reduce sizing 50% if drawdown >10%
+    "hard_stop_pp_extreme": 0.05,      # entries <10% or >90% -> close if dominant side moves +5pp
+    "hard_stop_pp_mid": 0.07,          # entries <20% or >80% -> close if dominant side moves +7pp
+    "hard_stop_pp_standard": 0.10,     # standard: close if dominant side moves +10pp
+    "sl_extreme_tight": -0.10,         # entries <10% or >90% -> SL -10% (was -25%)
+    "sl_extreme_mid": -0.15,           # entries <20% or >80% -> SL -15% (was -20%)
+    "sl_standard": -0.15,              # standard SL
 }
 
 # Where run logs are stored
@@ -106,12 +116,19 @@ def load_settings() -> dict:
             merged[key] = floor_val
 
     # ── Hard overrides: these values always come from code, never from saved file ──
-    # Critical for strategy pivots — prevents stale bot_settings.json from
-    # overriding new defaults after a deploy.
     HARDCODE = {
-        "position_size_usdc": 400.0,
+        "position_size_usdc": 200.0,     # REDUCED — protect capital
         "max_days_to_expiry": 30,
         "min_entry_price": 0.01,
+        "max_portfolio_risk_pct": 0.15,
+        "max_drawdown_pause_pct": 0.20,
+        "drawdown_reduce_sizing_pct": 0.10,
+        "hard_stop_pp_extreme": 0.05,
+        "hard_stop_pp_mid": 0.07,
+        "hard_stop_pp_standard": 0.10,
+        "sl_extreme_tight": -0.10,
+        "sl_extreme_mid": -0.15,
+        "sl_standard": -0.15,
     }
     for key, val in HARDCODE.items():
         merged[key] = val
@@ -181,7 +198,8 @@ class AutonomousPipeline:
         that invalidates the current extreme consensus.
         Returns (disruption_detected, news_headlines)
         """
-        query = f"{question[:100].strip()} 2025"
+        current_year = datetime.now(timezone.utc).year
+        query = f"{question[:100].strip()} {current_year}"
         try:
             snippets = self.researcher._search(query, 5)
         except Exception as e:
@@ -226,6 +244,29 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
             logger.warning(f"LLM disruption check failed: {e}")
             return False, news_summary
 
+    def _get_portfolio_drawdown(self) -> float:
+        """Returns current drawdown from peak equity (0.0 = no drawdown)."""
+        equity = self.db.get_equity_history()
+        if not equity:
+            return 0.0
+        peak = max(e.get("value", 0) for e in equity)
+        current = self.db.get_stats()["total_value"]
+        if peak <= 0:
+            return 0.0
+        return (peak - current) / peak
+
+    def _get_portfolio_heat(self) -> float:
+        """Returns fraction of portfolio currently at risk in open positions."""
+        portfolio = self.db.get_portfolio()
+        positions = portfolio.get("positions", {})
+        if not positions:
+            return 0.0
+        total_cost = sum(pos.get("cost_basis", 0) for pos in positions.values())
+        total_value = self.db.get_stats()["total_value"]
+        if total_value <= 0:
+            return 0.0
+        return total_cost / total_value
+
     def run_cycle(self) -> dict:
         """
         Executes one full bot cycle. Returns a run summary dict.
@@ -255,23 +296,45 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
             # ── Step 1: Auto-close positions that hit TP/SL or are expired ──────
             if self.settings.get("auto_close") and open_pos:
-                log(f"Checking {len(open_pos)} open positions for TP/SL/expiry…")
+                log(f"Checking {len(open_pos)} open positions for TP/SL/expiry/hard-stop…")
+                # Pre-fetch all markets for price refresh + hard-stop calculation
+                try:
+                    all_markets = self.fetcher.get_active_markets(limit=200)
+                    mkt_map = {m.id: m for m in all_markets}
+                except Exception:
+                    mkt_map = {}
+
                 for market_id, pos in list(open_pos.items()):
                     pnl_pct = (pos.get("current_value", pos["cost_basis"]) - pos["cost_basis"]) / pos["cost_basis"]
                     tp = self.settings.get("take_profit", 0.20)
-                    # Tier 2: tiered stop-loss by entry price
-                    # - Low entry (<30%): wider SL — volatile markets need more room
-                    # - High entry (>70%): tighter SL — near-certain markets shouldn't swing much
-                    # - Mid range: standard SL
                     entry_p = pos.get("entry_price", 0.5)
-                    if entry_p < 0.10 or entry_p > 0.90:
-                        sl = -0.25
-                    elif entry_p < 0.20 or entry_p > 0.80:
-                        sl = -0.20
-                    else:
-                        sl = self.settings.get("stop_loss", -0.15)
+                    side = pos.get("side", "YES")
 
-                    # Auto-close if market end_date has passed (+ 2 day grace period)
+                    # ── RISK v3: Tiered stop-loss ──
+                    # Tighter SL for extreme entries — capital preservation is #1
+                    if entry_p < 0.10 or entry_p > 0.90:
+                        sl = self.settings.get("sl_extreme_tight", -0.10)
+                    elif entry_p < 0.20 or entry_p > 0.80:
+                        sl = self.settings.get("sl_extreme_mid", -0.15)
+                    else:
+                        sl = self.settings.get("sl_standard", -0.15)
+
+                    # Refresh current price from live market data before any decision
+                    mkt = mkt_map.get(market_id)
+                    live_price = pos.get("current_price", entry_p)
+                    if mkt:
+                        token_id = mkt.yes_token_id if side == "YES" else mkt.no_token_id
+                        if token_id:
+                            fetched = self.fetcher.get_market_price(token_id)
+                            if fetched is not None:
+                                live_price = fetched
+                                self.trader.update_position_price(market_id, live_price)
+                                # Recalculate pnl with live price
+                                shares = pos.get("shares", 0)
+                                live_value = shares * live_price
+                                pnl_pct = (live_value - pos["cost_basis"]) / pos["cost_basis"] if pos["cost_basis"] > 0 else 0
+
+                    # Auto-close if market end_date has passed (+ 4h grace)
                     try:
                         end_date_str = pos.get("end_date", "")
                         if end_date_str:
@@ -281,25 +344,25 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 end_dt = end_dt.replace(tzinfo=timezone.utc)
                             if end_dt and datetime.now(timezone.utc) > end_dt + timedelta(hours=4):
                                 log(f"⏰ Market expired on {end_date_str[:10]}: {pos['question'][:50]}")
-                                self.trader.close_position(market_id, pos["current_price"], reason="expired")
+                                self.trader.close_position(market_id, live_price, reason="expired")
                                 trades_closed += 1
                                 continue
                     except Exception:
                         pass
+
                     # Fallback: auto-close positions open more than 14 days
                     try:
                         opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
                         days_open = (datetime.now(timezone.utc) - opened_at).days
                         if days_open >= 14:
-                            log(f"⏰ Closing stale position ({days_open}d): {pos['question'][:50]}")
-                            self.trader.close_position(market_id, pos["current_price"], reason="expired")
+                            log(f"⏰ Closing zombie position ({days_open}d): {pos['question'][:50]}")
+                            self.trader.close_position(market_id, live_price, reason="expired")
                             trades_closed += 1
                             continue
                     except Exception:
                         pass
 
-                    # Pre-expiry profit lock: close profitable positions near expiry
-                    # (council recommendation: Fix #2 — bug fix, not strategy change)
+                    # Pre-expiry profit lock
                     pre_lock_days = self.settings.get("pre_expiry_lock_days", 3)
                     try:
                         end_date_str = pos.get("end_date", "")
@@ -312,37 +375,86 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 days_left = (end_dt - datetime.now(timezone.utc)).days
                                 if days_left <= pre_lock_days:
                                     log(f"🔒 Pre-expiry lock ({days_left}d left, +{pnl_pct*100:.1f}%): {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, pos["current_price"], reason="pre_expiry_lock")
+                                    self.trader.close_position(market_id, live_price, reason="pre_expiry_lock")
                                     trades_closed += 1
                                     continue
                     except Exception:
                         pass
 
-                    # === STALE CLOSE — DESHABILITADO para estrategia contrarian ===
-                    # Las posiciones en extremos necesitan tiempo para revertir.
-                    # No cerrar por falta de movimiento.
-                    # stale_days = self.settings.get("stale_position_days", 5)
-                    # stale_move = self.settings.get("stale_position_movement", 0.03)
-                    # try:
-                    #     opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
-                    #     days_open = (datetime.now(timezone.utc) - opened_at).days
-                    #     if days_open >= stale_days:
-                    #         entry_p = pos.get("entry_price", pos.get("current_price", 0))
-                    #         curr_p = pos.get("current_price", entry_p)
-                    #         if entry_p > 0:
-                    #             movement = abs(curr_p - entry_p) / entry_p
-                    #             if movement < stale_move:
-                    #                 log(f"💤 Stale trade ({days_open}d, {movement*100:.1f}% move) — freeing capital: {pos['question'][:50]}")
-                    #                 self.trader.close_position(market_id, curr_p, reason="stale")
-                    #                 trades_closed += 1
-                    #                 continue
-                    # except Exception:
-                    #     pass
+                    # ── RISK v3: Hard stop if dominant side moved against us ──
+                    # Dynamic hard stop: tighter for extreme entries (less room to be wrong)
+                    entry_p = pos.get("entry_price", 0.5)
+                    if entry_p < 0.10 or entry_p > 0.90:
+                        hard_stop_pp = self.settings.get("hard_stop_pp_extreme", 0.05)
+                    elif entry_p < 0.20 or entry_p > 0.80:
+                        hard_stop_pp = self.settings.get("hard_stop_pp_mid", 0.07)
+                    else:
+                        hard_stop_pp = self.settings.get("hard_stop_pp_standard", 0.10)
+
+                    if mkt and hard_stop_pp > 0:
+                        yes_price = getattr(mkt, 'yes_price', 0.5)
+                        no_price = getattr(mkt, 'no_price', 0.5)
+                        dominant_moved = False
+                        if side == "NO":
+                            # We bought NO. If YES (dominant) went UP, that's against us.
+                            # Entry: YES was at (1 - entry_p). Current YES = yes_price.
+                            yes_at_entry = 1.0 - entry_p
+                            if yes_price - yes_at_entry >= hard_stop_pp:
+                                dominant_moved = True
+                                move_pp = yes_price - yes_at_entry
+                        else:  # side == "YES"
+                            # We bought YES. If NO (dominant) went UP, that's against us.
+                            no_at_entry = 1.0 - entry_p
+                            if no_price - no_at_entry >= hard_stop_pp:
+                                dominant_moved = True
+                                move_pp = no_price - no_at_entry
+                        if dominant_moved:
+                            log(f"🚨 HARD STOP: dominant side moved +{move_pp*100:.1f}pp against us — {pos['question'][:50]}")
+                            self.trader.close_position(market_id, live_price, reason="hard_stop")
+                            trades_closed += 1
+                            continue
+
+                    # ── RISK v3: Stale close (re-enabled, contrarian-aware) ──
+                    # If after N days the market is still at the same extreme (or more),
+                    # the contrarian thesis is not working — free the capital.
+                    stale_days = self.settings.get("stale_position_days", 7)
+                    stale_move = self.settings.get("stale_position_movement", 0.03)
+                    try:
+                        opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
+                        days_open = (datetime.now(timezone.utc) - opened_at).days
+                        if days_open >= stale_days:
+                            entry_p = pos.get("entry_price", pos.get("current_price", 0))
+                            curr_p = live_price
+                            if entry_p > 0:
+                                movement = abs(curr_p - entry_p) / entry_p
+                                # For contrarian: if price moved TOWARD the dominant side,
+                                # that's against us — close even if movement is small.
+                                # If price moved AWAY (our favor), that's good — don't close.
+                                if side == "YES" and curr_p < entry_p:
+                                    # YES went down (market favors NO more) — against us
+                                    log(f"💤 Stale+against ({days_open}d, YES fell {movement*100:.1f}%) — cutting: {pos['question'][:50]}")
+                                    self.trader.close_position(market_id, live_price, reason="stale")
+                                    trades_closed += 1
+                                    continue
+                                elif side == "NO" and curr_p < entry_p:
+                                    # NO went down (market favors YES more) — against us
+                                    log(f"💤 Stale+against ({days_open}d, NO fell {movement*100:.1f}%) — cutting: {pos['question'][:50]}")
+                                    self.trader.close_position(market_id, live_price, reason="stale")
+                                    trades_closed += 1
+                                    continue
+                                elif movement < stale_move:
+                                    # No significant movement at all — free capital
+                                    log(f"💤 Stale trade ({days_open}d, {movement*100:.1f}% move) — freeing capital: {pos['question'][:50]}")
+                                    self.trader.close_position(market_id, live_price, reason="stale")
+                                    trades_closed += 1
+                                    continue
+                    except Exception:
+                        pass
 
                     if pnl_pct >= tp:
                         log(f"✅ TP hit on {pos['question'][:50]} (+{pnl_pct*100:.1f}%) — closing")
                         try:
-                            self.trader.close_position(market_id, pos["current_price"], reason="take_profit")
+                            self.trader.close_position(market_id, live_price, reason="take_profit")
                             trades_closed += 1
                         except Exception as e:
                             log(f"Close error: {e}", "error")
@@ -350,7 +462,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                     elif pnl_pct <= sl:
                         log(f"🛑 SL hit on {pos['question'][:50]} ({pnl_pct*100:.1f}%) — closing")
                         try:
-                            self.trader.close_position(market_id, pos["current_price"], reason="stop_loss")
+                            self.trader.close_position(market_id, live_price, reason="stop_loss")
                             trades_closed += 1
                         except Exception as e:
                             log(f"Close error: {e}", "error")
@@ -361,12 +473,21 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                 open_pos = portfolio.get("positions", {})
                 balance = portfolio.get("balance", 0)
 
-            # ── Step 2: Check capacity ────────────────────────────────────────
+            # ── Step 2: Check capacity + risk limits ─────────────────────────
             max_pos = self.settings.get("max_open_positions", 8)
+            drawdown = self._get_portfolio_drawdown()
+            heat = self._get_portfolio_heat()
+            max_dd_pause = self.settings.get("max_drawdown_pause_pct", 0.20)
+            max_heat = self.settings.get("max_portfolio_risk_pct", 0.15)
+
             if len(open_pos) >= max_pos:
                 log(f"Max positions ({max_pos}) reached — skipping new trades")
             elif balance < self.settings.get("position_size_usdc", 200):
                 log(f"Insufficient balance (${balance:.2f}) — skipping new trades")
+            elif drawdown >= max_dd_pause:
+                log(f"🛑 DRAWDOWN PAUSE: dd={drawdown*100:.1f}% ≥ {max_dd_pause*100:.1f}% — no new entries")
+            elif heat >= max_heat:
+                log(f"🛑 HEAT LIMIT: {heat*100:.1f}% of portfolio at risk ≥ {max_heat*100:.1f}% — no new entries")
             else:
                 # ── Step 3: Fetch markets ─────────────────────────────────────
                 n = self.settings.get("max_markets_per_cycle", 15)
@@ -584,26 +705,33 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
                     try:
                         bal = self.db.get_portfolio().get("balance", 0)
-                        # === NUEVO SIZING ===
-                        base_size = self.settings.get("position_size_usdc", 400.0)
+                        # === RISK v3: Conservative dynamic sizing ===
+                        base_size = self.settings.get("position_size_usdc", 200.0)
                         edge_strength = abs(edge)
+
                         if edge_strength >= 0.10:
-                            multiplier = 1.5   # $600
+                            multiplier = 1.0   # $200
                         elif edge_strength >= 0.05:
-                            multiplier = 1.0   # $400
+                            multiplier = 0.75  # $150
                         else:
-                            multiplier = 0.5   # $200 (fallback)
+                            multiplier = 0.5   # $100 (fallback)
 
                         dynamic_size = round(base_size * multiplier)
 
-                        # CAP: nunca más del 10% del portfolio en una sola posición
-                        portfolio = self.trader.db.get_portfolio()
-                        portfolio_value = portfolio.get("balance", 10000)
-                        max_position = portfolio_value * 0.10
+                        # Drawdown reduction: if down >10%, halve sizing
+                        dd_reduce = self.settings.get("drawdown_reduce_sizing_pct", 0.10)
+                        if drawdown >= dd_reduce:
+                            dynamic_size = round(dynamic_size * 0.5)
+                            log(f"   📉 Sizing halved: drawdown {drawdown*100:.1f}%")
+
+                        # CAP: max 5% of total portfolio value per position
+                        portfolio_stats = self.db.get_stats()
+                        portfolio_value = portfolio_stats.get("total_value", 10000)
+                        max_position = portfolio_value * 0.05
                         dynamic_size = min(dynamic_size, max_position)
 
-                        # FLOOR: mínimo $300 para que fees no se coman todo
-                        dynamic_size = max(dynamic_size, 300.0)
+                        # FLOOR: minimum $100
+                        dynamic_size = max(dynamic_size, 100.0)
 
                         size = min(dynamic_size, bal)
                         self.trader.open_position(
@@ -620,7 +748,8 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                         trades_opened += 1
                         # Update in-memory open_pos to prevent re-entry in same cycle
                         open_pos[market.id] = {"entry_price": entry_price}
-                        log(f"   💰 Position opened: {side} ${size:.0f} (x{multiplier:.2f}) @ {entry_price:.4f}")
+                        effective_mult = round(size / base_size, 2) if base_size > 0 else 0
+                        log(f"   💰 Position opened: {side} ${size:.0f} (x{effective_mult}) @ {entry_price:.4f}")
                         logger.info(json.dumps({
                             "event": "CONTRARIAN_EVAL",
                             "market_id": market.id,

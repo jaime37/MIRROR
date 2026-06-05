@@ -109,16 +109,34 @@ class BotReporter:
                         "timestamp": t.get("timestamp"),
                     })
 
+        # Calculate drawdown and heat
+        equity = PortfolioDatabase().get_equity_history()
+        peak = max((e.get("value", 0) for e in equity), default=initial)
+        drawdown = (peak - total_value) / peak if peak > 0 else 0.0
+        heat = sum(p.get("cost_basis", 0) for p in positions.values()) / total_value if total_value > 0 else 0.0
+
         # Alertas
         alerts = []
-        if total_value < 9500:
-            alerts.append("🔴 PORTFOLIO < $9,500")
+        if total_value < 9000:
+            alerts.append("🔴 PORTFOLIO < $9,000")
+        elif total_value < 9500:
+            alerts.append("🟡 PORTFOLIO < $9,500")
+        if drawdown >= 0.20:
+            alerts.append(f"🔴 DRAWDOWN CRÍTICO: {drawdown*100:.1f}%")
+        elif drawdown >= 0.10:
+            alerts.append(f"🟡 DRAWDOWN: {drawdown*100:.1f}%")
+        if heat >= 0.15:
+            alerts.append(f"🔴 HEAT ALTO: {heat*100:.1f}% del portfolio en riesgo")
         if open_count >= 5:
             alerts.append("🟡 Máximo de posiciones alcanzado (5/5)")
         if pivot_violations:
             alerts.append(f"🔴 {len(pivot_violations)} posición(es) post-pivot en rango 15%-85%")
         if len(recent_trades) > 10 and sum(1 for t in recent_trades if t.get("type") == "CLOSE" and float(t.get("pnl", 0)) < 0) > 7:
             alerts.append("🟡 Win rate bajo en últimas 48h")
+        # Alert: open positions with hard-stop risk (dominant side moved against)
+        hard_stop_at_risk = sum(1 for p in position_analysis if p.get("risk_sl") == "🔴")
+        if hard_stop_at_risk >= 2:
+            alerts.append(f"🔴 {hard_stop_at_risk} posiciones en riesgo de SL duro")
 
         # Estado general
         if alerts and any("🔴" in a for a in alerts):
@@ -157,9 +175,14 @@ class BotReporter:
             },
             "alerts": alerts,
             "settings_summary": {
-                "position_size": settings.get("position_size_usdc", 400),
+                "position_size": settings.get("position_size_usdc", 200),
                 "min_edge": settings.get("min_edge", 0.10),
                 "max_expiry": settings.get("max_days_to_expiry", 30),
+            },
+            "risk_metrics": {
+                "drawdown_pct": round(drawdown * 100, 2),
+                "heat_pct": round(heat * 100, 2),
+                "peak_value": round(peak, 2),
             },
         }
 
