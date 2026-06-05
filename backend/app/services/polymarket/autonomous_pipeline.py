@@ -88,7 +88,10 @@ SETTINGS_FILE = os.path.join(LOG_DIR, "bot_settings.json")
 
 _bot_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
-_LAST_START_FILE = os.path.join(LOG_DIR, ".bot_last_start")
+# Use /tmp for debounce file so it does NOT survive container restarts.
+# If it were in LOG_DIR (persistent volume), Railway restarts would
+# see a fresh timestamp and refuse to start the bot forever.
+_LAST_START_FILE = "/tmp/.bot_last_start"
 
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
@@ -840,15 +843,23 @@ def get_bot_status() -> dict:
 def start_bot():
     global _bot_thread, _stop_event
 
-    # Cross-process debounce: refuse to start if another process started within 90s.
-    # Prevents triple-bot when Railway restarts the container rapidly.
+    # ── Debounce logic ─────────────────────────────────────────────────────
+    # 30s is enough to prevent double-start within the same process.
+    # File lives in /tmp so it is wiped on container restart → bot always
+    # starts after a Railway redeploy or crash-recovery.
     os.makedirs(LOG_DIR, exist_ok=True)
     now_ts = time.time()
+
+    # If a thread is already alive, do nothing (idempotent)
+    if _bot_thread and _bot_thread.is_alive():
+        logger.info("start_bot(): bot thread already alive — skipping")
+        return {"started": False, "reason": "already_running"}
+
     if os.path.exists(_LAST_START_FILE):
         try:
-            with open(_LAST_START_FILE, "r") as _f:
+            with open(_LAST_START_FILE, "r", encoding="utf-8") as _f:
                 _last = float(_f.read().strip())
-            if now_ts - _last < 90:
+            if now_ts - _last < 30:
                 logger.warning(
                     f"start_bot() called only {now_ts - _last:.0f}s after last start — skipping duplicate"
                 )
@@ -856,16 +867,12 @@ def start_bot():
         except Exception:
             pass
     try:
-        with open(_LAST_START_FILE, "w") as _f:
+        with open(_LAST_START_FILE, "w", encoding="utf-8") as _f:
             _f.write(str(now_ts))
     except Exception:
         pass
 
-    if _bot_thread and _bot_thread.is_alive():
-        # Stop existing instance before starting a new one (prevents double bot)
-        _stop_event.set()
-        _bot_thread.join(timeout=5)
-
+    # ── Start fresh thread ─────────────────────────────────────────────────
     _stop_event = threading.Event()
     _stop_event.clear()
 
@@ -886,6 +893,7 @@ def start_bot():
 
     _bot_thread = threading.Thread(target=loop, daemon=True, name="polymarket-bot")
     _bot_thread.start()
+    logger.info("start_bot(): bot thread launched successfully")
     return {"started": True}
 
 

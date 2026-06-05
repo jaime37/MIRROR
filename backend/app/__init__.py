@@ -76,21 +76,56 @@ def create_app(config_class=Config):
     # 健康检查
     @app.route('/health')
     def health():
-        return {'status': 'ok', 'service': 'MiroFish Backend'}
+        try:
+            from .services.polymarket.autonomous_pipeline import get_bot_status
+            bot_status = get_bot_status()
+        except Exception:
+            bot_status = {"running": False}
+        return {
+            'status': 'ok',
+            'service': 'MiroFish Backend',
+            'bot': {
+                'running': bot_status.get('running', False),
+            }
+        }
 
     @app.route('/')
     def index():
         return {'service': 'MiroFish Backend', 'status': 'ok', 'docs': '/health'}
     
-    # Auto-start the autonomous bot on server startup
+    # ── Auto-start the autonomous bot ─────────────────────────────────────
     try:
         from .services.polymarket.autonomous_pipeline import start_bot
         start_bot()
         if should_log_startup:
-            logger.info("🤖 Autonomous bot auto-started")
+            logger.info("Autonomous bot auto-started")
     except Exception as e:
         if should_log_startup:
             logger.warning(f"Bot auto-start failed: {e}")
+
+    # ── Watchdog: restart bot if thread dies (Railway won't restart container
+    #    if Flask health-check is still OK, but the bot thread may crash) ──
+    def _bot_watchdog():
+        import threading
+        import time
+        watchdog_logger = get_logger('mirofish.watchdog')
+        while True:
+            time.sleep(300)  # 5 minutes
+            try:
+                from .services.polymarket.autonomous_pipeline import (
+                    get_bot_status, start_bot
+                )
+                status = get_bot_status()
+                if not status.get("running"):
+                    watchdog_logger.warning(
+                        "Watchdog: bot thread not running — restarting"
+                    )
+                    start_bot()
+            except Exception as e:
+                watchdog_logger.error(f"Watchdog error: {e}")
+
+    _watchdog = threading.Thread(target=_bot_watchdog, daemon=True, name="bot-watchdog")
+    _watchdog.start()
 
     if should_log_startup:
         logger.info("MiroFish Backend 启动完成")
