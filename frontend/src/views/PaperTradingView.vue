@@ -21,7 +21,7 @@
     <section class="pt-kpis">
       <div class="kpi-card">
         <div class="kpi-label">Portfolio Value</div>
-        <div class="kpi-value" :class="pnlClass(stats.total_value - stats.balance - stats.positions_value)">
+        <div class="kpi-value" :class="pnlClass(stats.total_pnl)">
           ${{ fmt(stats.total_value) }}
         </div>
         <div class="kpi-sub">Cash: ${{ fmt(stats.balance) }}</div>
@@ -380,7 +380,8 @@ import { polymarketApi } from '../api/polymarket'
 // ── State ──────────────────────────────────────────────────
 const stats = ref({
   balance: 10000, positions_value: 0, total_value: 10000,
-  total_pnl: 0, total_return_pct: 0, total_trades: 0,
+  total_pnl: 0, realized_pnl: 0, unrealized_pnl: 0,
+  total_return_pct: 0, total_trades: 0,
   closed_trades: 0, open_positions: 0, win_rate: 0, wins: 0, losses: 0,
 })
 const openPositions = ref([])
@@ -434,11 +435,11 @@ let _autoRefreshTimer = null
 
 onMounted(async () => {
   await Promise.all([refreshAll(), loadBotStatus()])
-  // Auto-refresh every 60 s so the dashboard always shows live data
+  // Auto-refresh every 30 s so the dashboard always shows live data
   // without the user having to click Refresh manually
   _autoRefreshTimer = setInterval(async () => {
     await Promise.all([loadPortfolio(), loadTrades(), loadBotStatus()])
-  }, 60_000)
+  }, 30_000)
 })
 
 onUnmounted(() => {

@@ -115,7 +115,7 @@ class PortfolioDatabase:
 
         wins = [t for t in closed if t.get("pnl", 0) > 0]
         losses = [t for t in closed if t.get("pnl", 0) <= 0]
-        total_pnl = sum(t.get("pnl", 0) for t in closed)
+        realized_pnl = sum(t.get("pnl", 0) for t in closed)
         win_rate = len(wins) / len(closed) if closed else 0.0
 
         equity_history = self.get_equity_history()
@@ -129,11 +129,20 @@ class PortfolioDatabase:
         )
         total_value = current_balance + positions_value
 
+        # unrealized PnL from open positions (so total_pnl reflects true profit)
+        unrealized_pnl = sum(
+            pos.get("unrealized_pnl", 0)
+            for pos in portfolio.get("positions", {}).values()
+        )
+        total_pnl = realized_pnl + unrealized_pnl
+
         return {
             "balance": round(current_balance, 4),
             "positions_value": round(positions_value, 4),
             "total_value": round(total_value, 4),
             "total_pnl": round(total_pnl, 4),
+            "realized_pnl": round(realized_pnl, 4),
+            "unrealized_pnl": round(unrealized_pnl, 4),
             "total_return_pct": round((total_value - initial) / initial * 100, 2),
             "total_trades": len(trades),
             "closed_trades": len(closed),
