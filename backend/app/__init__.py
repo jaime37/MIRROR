@@ -3,6 +3,7 @@ MiroFish Backend - Flask应用工厂
 """
 
 import os
+import threading
 import warnings
 
 # 抑制 multiprocessing resource_tracker 的警告（来自第三方库如 transformers）
@@ -73,40 +74,34 @@ def create_app(config_class=Config):
     app.register_blueprint(report_bp, url_prefix='/api/report')
     app.register_blueprint(polymarket_bp, url_prefix='/api/polymarket')
     
-    # 健康检查
+    # 健康检查 — 必须保持极简 (< 10 ms)，Railway health-check 超时很短
     @app.route('/health')
     def health():
-        try:
-            from .services.polymarket.autonomous_pipeline import get_bot_status
-            bot_status = get_bot_status()
-        except Exception:
-            bot_status = {"running": False}
-        return {
-            'status': 'ok',
-            'service': 'MiroFish Backend',
-            'bot': {
-                'running': bot_status.get('running', False),
-            }
-        }
+        return {'status': 'ok', 'service': 'MiroFish Backend'}
 
     @app.route('/')
     def index():
         return {'service': 'MiroFish Backend', 'status': 'ok', 'docs': '/health'}
-    
-    # ── Auto-start the autonomous bot ─────────────────────────────────────
-    try:
-        from .services.polymarket.autonomous_pipeline import start_bot
-        start_bot()
-        if should_log_startup:
-            logger.info("Autonomous bot auto-started")
-    except Exception as e:
-        if should_log_startup:
-            logger.warning(f"Bot auto-start failed: {e}")
+
+    # ── Auto-start the autonomous bot (deferred so Flask boots first) ─────
+    def _delayed_bot_start():
+        import time
+        time.sleep(3)  # give Flask time to begin accepting requests
+        try:
+            from .services.polymarket.autonomous_pipeline import start_bot
+            result = start_bot()
+            if should_log_startup:
+                logger.info(f"Autonomous bot start result: {result}")
+        except Exception as e:
+            if should_log_startup:
+                logger.warning(f"Bot auto-start failed: {e}")
+
+    _starter = threading.Thread(target=_delayed_bot_start, daemon=True, name="bot-starter")
+    _starter.start()
 
     # ── Watchdog: restart bot if thread dies (Railway won't restart container
     #    if Flask health-check is still OK, but the bot thread may crash) ──
     def _bot_watchdog():
-        import threading
         import time
         watchdog_logger = get_logger('mirofish.watchdog')
         while True:
