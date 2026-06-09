@@ -44,7 +44,7 @@ DEFAULT_SETTINGS = {
     "max_open_positions": 5,
     "min_volume": 5000,
     "min_liquidity": 1000,
-    "min_entry_price": 0.01,           # allow extreme contrarian entries (1-15% range)
+    "min_entry_price": 0.15,           # floor: avoid penny markets (<15%)
     "excluded_market_keywords": [
         "nba", "nfl", "nhl", "mlb", "mls",
         "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "champions league",
@@ -58,19 +58,19 @@ DEFAULT_SETTINGS = {
     "takeprofit_cooldown_days": 3,
     "auto_close": True,
     "delay_between_markets": 8,
-    "max_days_to_expiry": 30,
+    "max_days_to_expiry": 60,
     "long_term_position_ratio": 0.40,
     "pre_expiry_lock_days": 5,
     "min_days_to_expiry_entry": 7,
-    "stale_position_days": 7,          # RE-ENABLED: 5→7d — contrarian needs time, but not forever
+    "stale_position_days": 5,          # close dead positions faster to free heat/capital
     "stale_position_movement": 0.03,
     # Tier 2: dynamic position sizing multipliers
-    "size_multiplier_high_conf_large_edge": 1.00,  # high conf + edge ≥20% → $200
-    "size_multiplier_high_conf_base": 0.75,        # high conf + edge 10-20% → $150
-    "size_multiplier_medium_conf_large_edge": 0.75,# medium conf + edge ≥20% → $150
-    "size_multiplier_medium_conf_base": 0.50,      # medium conf + edge 10-20% → $100
+    "size_multiplier_high_conf_large_edge": 1.25,  # high conf + edge ≥10% → $250
+    "size_multiplier_high_conf_base": 1.00,        # high conf + edge 5-10% → $200
+    "size_multiplier_medium_conf_large_edge": 0.85,# medium conf + edge ≥10% → $170
+    "size_multiplier_medium_conf_base": 0.70,      # medium conf + edge 5-10% → $140
     # ── RISK MANAGEMENT v3 ──
-    "max_portfolio_risk_pct": 0.15,    # max 15% of portfolio at risk across open positions
+    "max_portfolio_risk_pct": 0.20,    # max 20% of portfolio at risk across open positions
     "max_drawdown_pause_pct": 0.20,    # pause new entries if drawdown >20%
     "drawdown_reduce_sizing_pct": 0.10,# reduce sizing 50% if drawdown >10%
     "hard_stop_pp_extreme": 0.05,      # entries <10% or >90% -> close if dominant side moves +5pp
@@ -109,7 +109,7 @@ def load_settings() -> dict:
     # This ensures code-level upgrades take effect even when bot_settings.json
     # has stale values from a previous deploy.
     FLOOR = {
-        "min_entry_price": 0.01,          # contrarian strategy — allow extreme entries < 5%
+        "min_entry_price": 0.15,          # floor: avoid penny markets, protect against extreme low-prob risk
         "min_edge": 0.10,                 # council Tier 1 — never below 10%
         "min_days_to_expiry_entry": 7,    # Tier 2 — hard block, never disable
         "pre_expiry_lock_days": 5,        # Tier 2 — protect profits, never below 5d
@@ -121,9 +121,9 @@ def load_settings() -> dict:
     # ── Hard overrides: these values always come from code, never from saved file ──
     HARDCODE = {
         "position_size_usdc": 200.0,     # REDUCED — protect capital
-        "max_days_to_expiry": 30,
-        "min_entry_price": 0.01,
-        "max_portfolio_risk_pct": 0.15,
+        "max_days_to_expiry": 60,
+        "min_entry_price": 0.15,
+        "max_portfolio_risk_pct": 0.20,
         "max_drawdown_pause_pct": 0.20,
         "drawdown_reduce_sizing_pct": 0.10,
         "hard_stop_pp_extreme": 0.05,
@@ -481,7 +481,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
             drawdown = self._get_portfolio_drawdown()
             heat = self._get_portfolio_heat()
             max_dd_pause = self.settings.get("max_drawdown_pause_pct", 0.20)
-            max_heat = self.settings.get("max_portfolio_risk_pct", 0.15)
+            max_heat = self.settings.get("max_portfolio_risk_pct", 0.20)
 
             if len(open_pos) >= max_pos:
                 log(f"Max positions ({max_pos}) reached — skipping new trades")
@@ -708,14 +708,17 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
                     try:
                         bal = self.db.get_portfolio().get("balance", 0)
-                        # === RISK v3: Conservative dynamic sizing ===
+                        # === RISK v3: Dynamic sizing using settings multipliers ===
                         base_size = self.settings.get("position_size_usdc", 200.0)
                         edge_strength = abs(edge)
+                        conf_key = (confidence or "medium").lower().replace(" ", "_")
 
                         if edge_strength >= 0.10:
-                            multiplier = 1.0   # $200
+                            mult_key = f"size_multiplier_{conf_key}_conf_large_edge"
+                            multiplier = self.settings.get(mult_key, 1.0)
                         elif edge_strength >= 0.05:
-                            multiplier = 0.75  # $150
+                            mult_key = f"size_multiplier_{conf_key}_conf_base"
+                            multiplier = self.settings.get(mult_key, 0.75)
                         else:
                             multiplier = 0.5   # $100 (fallback)
 
