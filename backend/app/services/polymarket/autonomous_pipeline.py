@@ -32,7 +32,7 @@ logger = get_logger("mirofish.polymarket.autonomous")
 
 # ── Default settings ──────────────────────────────────────────────────────────
 DEFAULT_SETTINGS = {
-    "max_markets_per_cycle": 10,
+    "max_markets_per_cycle": 30,
     "position_size_usdc": 200.0,       # REDUCED: 400→200 — protect damaged portfolio
     "min_edge": 0.10,                  # council Tier 1: stronger signal
     "min_confidence": ["high", "medium"],
@@ -44,7 +44,7 @@ DEFAULT_SETTINGS = {
     "max_open_positions": 5,
     "min_volume": 5000,
     "min_liquidity": 1000,
-    "min_entry_price": 0.15,           # floor: avoid penny markets (<15%)
+    "min_entry_price": 0.03,           # allow extreme contrarian entries (underdog >=3%)
     "excluded_market_keywords": [
         "nba", "nfl", "nhl", "mlb", "mls",
         "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "champions league",
@@ -109,7 +109,7 @@ def load_settings() -> dict:
     # This ensures code-level upgrades take effect even when bot_settings.json
     # has stale values from a previous deploy.
     FLOOR = {
-        "min_entry_price": 0.15,          # floor: avoid penny markets, protect against extreme low-prob risk
+        "min_entry_price": 0.03,          # floor: allow extreme contrarian entries
         "min_edge": 0.10,                 # council Tier 1 — never below 10%
         "min_days_to_expiry_entry": 7,    # Tier 2 — hard block, never disable
         "pre_expiry_lock_days": 5,        # Tier 2 — protect profits, never below 5d
@@ -122,7 +122,7 @@ def load_settings() -> dict:
     HARDCODE = {
         "position_size_usdc": 200.0,     # REDUCED — protect capital
         "max_days_to_expiry": 60,
-        "min_entry_price": 0.15,
+        "min_entry_price": 0.03,
         "max_portfolio_risk_pct": 0.20,
         "max_drawdown_pause_pct": 0.20,
         "drawdown_reduce_sizing_pct": 0.10,
