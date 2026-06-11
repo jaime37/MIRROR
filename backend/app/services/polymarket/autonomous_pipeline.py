@@ -597,7 +597,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
                     # === NUEVO: Filtro de extremos (contrarian) ===
                     # Si ambos lados están entre 15% y 85%, SKIP. No hay edge contrarian.
-                    if (0.15 < market.yes_price < 0.85) and (0.15 < market.no_price < 0.85):
+                    if (0.15 < market.yes_price < 0.80) and (0.15 < market.no_price < 0.80):
                         log(f"   ⏭️ Skip middle range (YES={market.yes_price:.2%}, NO={market.no_price:.2%}) — no contrarian edge")
                         continue
 
@@ -621,16 +621,16 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                     confidence = None
                     edge = 0.0
 
-                    if market.yes_price > 0.85 and not disruption:
+                    if market.yes_price > 0.80 and not disruption:
                         side = "NO"
                         entry_price = market.no_price
                         confidence = "high"
-                        edge = market.yes_price - 0.85
-                    elif market.no_price > 0.85 and not disruption:
+                        edge = market.yes_price - 0.80
+                    elif market.no_price > 0.80 and not disruption:
                         side = "YES"
                         entry_price = market.yes_price
                         confidence = "high"
-                        edge = market.no_price - 0.85
+                        edge = market.no_price - 0.80
                     elif disruption:
                         log(f"   ⚠️ Disruption detected — market may be adjusting, skip")
                         logger.info(json.dumps({
@@ -702,7 +702,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
                     log(
                         f"   ✅ CONTRARIAN EDGE: {side} | "
-                        f"extreme={'YES' if market.yes_price > 0.85 else 'NO'} "
+                        f"extreme={'YES' if market.yes_price > 0.80 else 'NO'} "
                         f"edge={edge:.3f} disruption={disruption}"
                     )
 
@@ -748,7 +748,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                             amount_usdc=size,
                             estimated_prob=0.5,  # no longer used meaningfully
                             confidence=confidence,
-                            reasoning=f"Extreme contrarian: fade {'YES' if market.yes_price > 0.85 else 'NO'} consensus @ {edge:.1%} excess. News: {'; '.join(news_summary[:3])}",
+                            reasoning=f"Extreme contrarian: fade {'YES' if market.yes_price > 0.80 else 'NO'} consensus @ {edge:.1%} excess. News: {'; '.join(news_summary[:3])}",
                             end_date=market.end_date,
                         )
                         trades_opened += 1
