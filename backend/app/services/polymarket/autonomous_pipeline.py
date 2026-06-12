@@ -36,10 +36,16 @@ DEFAULT_SETTINGS = {
     "position_size_usdc": 200.0,       # REDUCED: 400→200 — protect damaged portfolio
     "min_edge": 0.10,                  # council Tier 1: stronger signal
     "min_confidence": ["high", "medium"],
-    "take_profit": 0.20,
-    "stop_loss": -0.15,                # base SL; actual SL is tiered by entry price
-    "stop_loss_low_entry": -0.20,      # entry < 30%
-    "stop_loss_high_entry": -0.10,     # entry > 70%
+    # Adaptive take-profit by entry price — let extreme contrarian outliers run
+    "tp_under_05": 1.00,               # entry < 5% or > 95%
+    "tp_under_10": 0.50,               # entry < 10% or > 90%
+    "tp_under_20": 0.30,               # entry < 20% or > 80%
+    "tp_standard": 0.20,               # standard TP
+    # Adaptive stop-loss by entry price
+    "sl_under_05": -0.15,              # entry < 5% or > 95%
+    "sl_under_10": -0.10,              # entry < 10% or > 90%
+    "sl_under_20": -0.15,              # entry < 20% or > 80%
+    "sl_standard": -0.15,              # standard SL
     "cycle_interval_minutes": 30,
     "max_open_positions": 5,
     "min_volume": 5000,
@@ -73,12 +79,11 @@ DEFAULT_SETTINGS = {
     "max_portfolio_risk_pct": 0.20,    # max 20% of portfolio at risk across open positions
     "max_drawdown_pause_pct": 0.20,    # pause new entries if drawdown >20%
     "drawdown_reduce_sizing_pct": 0.10,# reduce sizing 50% if drawdown >10%
-    "hard_stop_pp_extreme": 0.05,      # entries <10% or >90% -> close if dominant side moves +5pp
-    "hard_stop_pp_mid": 0.07,          # entries <20% or >80% -> close if dominant side moves +7pp
+    # Adaptive hard-stop (dominant-side point move) by entry price
+    "hard_stop_pp_under_05": 0.10,     # entries <5% or >95% -> close if dominant side moves +10pp
+    "hard_stop_pp_under_10": 0.07,     # entries <10% or >90% -> close if dominant side moves +7pp
+    "hard_stop_pp_under_20": 0.07,     # entries <20% or >80% -> close if dominant side moves +7pp
     "hard_stop_pp_standard": 0.10,     # standard: close if dominant side moves +10pp
-    "sl_extreme_tight": -0.10,         # entries <10% or >90% -> SL -10% (was -25%)
-    "sl_extreme_mid": -0.15,           # entries <20% or >80% -> SL -15% (was -20%)
-    "sl_standard": -0.15,              # standard SL
 }
 
 # Where run logs are stored
@@ -126,12 +131,19 @@ def load_settings() -> dict:
         "max_portfolio_risk_pct": 0.20,
         "max_drawdown_pause_pct": 0.20,
         "drawdown_reduce_sizing_pct": 0.10,
-        "hard_stop_pp_extreme": 0.05,
-        "hard_stop_pp_mid": 0.07,
-        "hard_stop_pp_standard": 0.10,
-        "sl_extreme_tight": -0.10,
-        "sl_extreme_mid": -0.15,
+        # Adaptive TP/SL/Hard-stop by entry price (updated 2026-06-12)
+        "tp_under_05": 1.00,
+        "tp_under_10": 0.50,
+        "tp_under_20": 0.30,
+        "tp_standard": 0.20,
+        "sl_under_05": -0.15,
+        "sl_under_10": -0.10,
+        "sl_under_20": -0.15,
         "sl_standard": -0.15,
+        "hard_stop_pp_under_05": 0.10,
+        "hard_stop_pp_under_10": 0.07,
+        "hard_stop_pp_under_20": 0.07,
+        "hard_stop_pp_standard": 0.10,
     }
     for key, val in HARDCODE.items():
         merged[key] = val
@@ -309,16 +321,27 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
                 for market_id, pos in list(open_pos.items()):
                     pnl_pct = (pos.get("current_value", pos["cost_basis"]) - pos["cost_basis"]) / pos["cost_basis"]
-                    tp = self.settings.get("take_profit", 0.20)
                     entry_p = pos.get("entry_price", 0.5)
                     side = pos.get("side", "YES")
 
-                    # ── RISK v3: Tiered stop-loss ──
-                    # Tighter SL for extreme entries — capital preservation is #1
-                    if entry_p < 0.10 or entry_p > 0.90:
-                        sl = self.settings.get("sl_extreme_tight", -0.10)
+                    # ── RISK v4: Adaptive TP/SL by entry price ──
+                    # Extreme contrarian entries get wider TP to capture outliers,
+                    # while keeping tight SL for capital preservation.
+                    if entry_p < 0.05 or entry_p > 0.95:
+                        tp = self.settings.get("tp_under_05", 1.00)
+                    elif entry_p < 0.10 or entry_p > 0.90:
+                        tp = self.settings.get("tp_under_10", 0.50)
                     elif entry_p < 0.20 or entry_p > 0.80:
-                        sl = self.settings.get("sl_extreme_mid", -0.15)
+                        tp = self.settings.get("tp_under_20", 0.30)
+                    else:
+                        tp = self.settings.get("tp_standard", 0.20)
+
+                    if entry_p < 0.05 or entry_p > 0.95:
+                        sl = self.settings.get("sl_under_05", -0.15)
+                    elif entry_p < 0.10 or entry_p > 0.90:
+                        sl = self.settings.get("sl_under_10", -0.10)
+                    elif entry_p < 0.20 or entry_p > 0.80:
+                        sl = self.settings.get("sl_under_20", -0.15)
                     else:
                         sl = self.settings.get("sl_standard", -0.15)
 
@@ -384,13 +407,15 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                     except Exception:
                         pass
 
-                    # ── RISK v3: Hard stop if dominant side moved against us ──
-                    # Dynamic hard stop: tighter for extreme entries (less room to be wrong)
-                    entry_p = pos.get("entry_price", 0.5)
-                    if entry_p < 0.10 or entry_p > 0.90:
-                        hard_stop_pp = self.settings.get("hard_stop_pp_extreme", 0.05)
+                    # ── RISK v4: Hard stop if dominant side moved against us ──
+                    # Dynamic hard stop: relaxed for extreme entries to avoid noise,
+                    # standard for balanced entries.
+                    if entry_p < 0.05 or entry_p > 0.95:
+                        hard_stop_pp = self.settings.get("hard_stop_pp_under_05", 0.10)
+                    elif entry_p < 0.10 or entry_p > 0.90:
+                        hard_stop_pp = self.settings.get("hard_stop_pp_under_10", 0.07)
                     elif entry_p < 0.20 or entry_p > 0.80:
-                        hard_stop_pp = self.settings.get("hard_stop_pp_mid", 0.07)
+                        hard_stop_pp = self.settings.get("hard_stop_pp_under_20", 0.07)
                     else:
                         hard_stop_pp = self.settings.get("hard_stop_pp_standard", 0.10)
 

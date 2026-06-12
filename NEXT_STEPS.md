@@ -2,11 +2,11 @@
 
 Portfolio: 10406.89
 Posiciones: 5/5
-Win rate: 19.5pct
+Win rate: 22.2pct
 
 ## Proximo paso recomendado
 
-Revisar y ajustar stop-loss / take-profit para entradas en precios < 0.10, ya que el stop loss de -15pct no funciona bien en ese rango.
+Implementar simulación de slippage y liquidez en paper trading, o revisar el filtro de selección de mercados para reducir trades expirados/stale con pérdida de comisiones (~4%).
 
 ## Contexto completo
 
@@ -24,15 +24,15 @@ del mercado supera el 80pct o cae bajo el 20pct.
 ### Problemas criticos identificados
 
 1. ~~Persistencia JSON plano en Railway multi-replica -> race conditions graves.~~ **Mitigado:** forzada 1 replica en Railway.
-2. Win rate muy bajo (19.5pct) dependiente de outliers positivos.
-3. Stop loss de -15pct no funciona bien en precios < 0.10.
+2. Win rate muy bajo (22.2pct) dependiente de outliers positivos.
+3. ~~Stop loss de -15pct no funciona bien en precios < 0.10.~~ **Mitigado:** TP/SL/hard-stop adaptativos por rango de entrada (RISK v4).
 4. Sin simulacion de slippage ni liquidez en paper trading.
 5. bot_settings.json puede quedar stale vs codigo fuente.
 
 ### Estado del deployment
 
-- Commit deployado: `5caed1d` (`deploy(railway): force single replica to prevent JSON race conditions`)
-- Deployment Railway: `13412549-b3f7-40b4-b80a-8b7c162bd344` — **SUCCESS**
+- Commit deployado: ver último commit en `main`
+- Deployment Railway: ver deployment más reciente en servicio `MIRROR`
 - Replicas configuradas: **1**
 - Instancias corriendo: **1 (RUNNING)**
 - Healthcheck: **200 OK** (`mirror-production-bff6.up.railway.app/health`)
@@ -47,17 +47,16 @@ del mercado supera el 80pct o cae bajo el 20pct.
 
 ## Primer paso recomendado
 
-Revisar y ajustar stop-loss / take-profit para entradas en precios < 0.10.
-El stop loss fijo de -15pct es inefectivo cuando el precio de entrada ya es
-extremo; hay que definir niveles adaptativos (sl_extreme_tight, sl_extreme_mid)
-y validar con los ultimos trades cerrados.
+Implementar simulación de slippage y liquidez en paper trading, o afinar el
+filtro de selección de mercados para reducir la proporción de trades que
+terminan `expired`/`stale` con pérdida de comisiones (~4%).
 
 ### Prompt para la siguiente conversacion
 
 Continua con el bot MiroFish Polymarket. El estado actual esta en NEXT_STEPS.md.
-El siguiente paso es revisar el stop-loss para entradas en precios < 0.10.
-Abre `backend/app/services/polymarket/autonomous_pipeline.py` y el historial de
-trades recientes, analiza como se comportaron las posiciones que entraron por
-debajo de 0.10, y propone ajustes a los parametros `sl_extreme_tight`,
-`sl_extreme_mid`, `stop_loss_low_entry` y similares. Luego commitea y pushea
-los cambios si mejoran el riesgo/retorno esperado.
+El siguiente paso es implementar simulacion de slippage/liquidez en paper trading
+o revisar el filtro de mercados para reducir trades expirados/stale. Abre
+`backend/app/services/polymarket/paper_trader.py` y el historial de trades
+recientes, analiza donde se podría modelar el impacto de liquidez/comisiones,
+y propone ajustes. Luego commitea y pushea los cambios si mejoran el
+riesgo/retorno esperado.
