@@ -28,20 +28,20 @@ class BotReporter:
 
     def generate_report(self) -> Dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
-        portfolio = self._load_json("portfolio.json") or {}
-        trades_raw = self._load_json("trades.json") or []
+        # Use SQLite-backed portfolio DB as the single source of truth
+        from .portfolio_db import PortfolioDatabase
+        db = PortfolioDatabase()
+        portfolio = db.get_portfolio()
+        trades_raw = db.get_trades()
         settings = self._load_json("bot_settings.json") or {}
 
         # Portfolio summary
         balance = portfolio.get("balance", 0)
         initial = portfolio.get("initial_balance", 10000)
         positions = portfolio.get("positions", {})
-        total_value = portfolio.get("total_value", balance)
+        stats = db.get_stats()
+        total_value = stats.get("total_value", balance)
         open_count = len(positions)
-
-        # Calcular stats desde trades (portfolio.json no tiene campo stats)
-        from .portfolio_db import PortfolioDatabase
-        stats = PortfolioDatabase().get_stats()
 
         # Trades recientes (últimas 48h)
         cutoff = datetime.now(timezone.utc).timestamp() - (48 * 3600)
@@ -110,7 +110,7 @@ class BotReporter:
                     })
 
         # Calculate drawdown and heat
-        equity = PortfolioDatabase().get_equity_history()
+        equity = db.get_equity_history()
         peak = max((e.get("value", 0) for e in equity), default=initial)
         drawdown = (peak - total_value) / peak if peak > 0 else 0.0
         heat = sum(p.get("cost_basis", 0) for p in positions.values()) / total_value if total_value > 0 else 0.0

@@ -23,7 +23,7 @@ from typing import Optional
 
 from .market_fetcher import MarketFetcher
 from .news_researcher import NewsResearcher
-from .paper_trader import PaperTrader
+from .paper_trader import PaperTrader, FEE_RATE
 from .portfolio_db import PortfolioDatabase
 from .bot_reporter import BotReporter
 from ...utils.logger import get_logger
@@ -77,8 +77,13 @@ DEFAULT_SETTINGS = {
     "size_multiplier_medium_conf_base": 0.70,      # medium conf + edge 5-10% → $140
     # ── RISK MANAGEMENT v3 ──
     "max_portfolio_risk_pct": 0.20,    # max 20% of portfolio at risk across open positions
-    "max_drawdown_pause_pct": 0.20,    # pause new entries if drawdown >20%
+    "dd_soft_reduce_pct": 0.05,        # reduce sizing 25% if drawdown >5%
+    "dd_soft_reduce_factor": 0.75,     # multiplier after soft reduce
     "drawdown_reduce_sizing_pct": 0.10,# reduce sizing 50% if drawdown >10%
+    "max_drawdown_pause_pct": 0.15,    # pause new entries if drawdown >15%
+    # Scoring & diversification
+    "min_opportunity_score": 50.0,     # minimum composite score to open a trade
+    "max_positions_per_category": 2,   # avoid concentration in one theme
     # Adaptive hard-stop (dominant-side point move) by entry price
     "hard_stop_pp_under_05": 0.10,     # entries <5% or >95% -> close if dominant side moves +10pp
     "hard_stop_pp_under_10": 0.07,     # entries <10% or >90% -> close if dominant side moves +7pp
@@ -129,8 +134,12 @@ def load_settings() -> dict:
         "max_days_to_expiry": 60,
         "min_entry_price": 0.03,
         "max_portfolio_risk_pct": 0.20,
-        "max_drawdown_pause_pct": 0.20,
+        "dd_soft_reduce_pct": 0.05,
+        "dd_soft_reduce_factor": 0.75,
         "drawdown_reduce_sizing_pct": 0.10,
+        "max_drawdown_pause_pct": 0.15,
+        "min_opportunity_score": 50.0,
+        "max_positions_per_category": 2,
         # Adaptive TP/SL/Hard-stop by entry price (updated 2026-06-12)
         "tp_under_05": 1.00,
         "tp_under_10": 0.50,
@@ -282,6 +291,67 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
             return 0.0
         return total_cost / total_value
 
+    def _days_to_expiry(self, end_date_str: str) -> Optional[float]:
+        """Returns days remaining until market end_date, or None if not set."""
+        if not end_date_str:
+            return None
+        try:
+            from dateutil import parser as dateparser
+            end_dt = dateparser.parse(end_date_str)
+            if end_dt and end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if end_dt:
+                return (end_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
+        except Exception:
+            pass
+        return None
+
+    def _score_opportunity(
+        self,
+        market,
+        edge: float,
+        news_summary: list[str],
+        open_categories: dict[str, int],
+    ) -> float:
+        """
+        Composite score (0-100) for a contrarian opportunity.
+        Higher is better. Penalizes low liquidity, short expiry, and
+        category concentration.
+        """
+        score = 0.0
+
+        # 1. Edge (0-35): bigger extreme consensus fade = better
+        edge_strength = abs(edge)
+        score += min(35.0, max(0.0, (edge_strength - 0.05) / 0.15 * 35.0))
+
+        # 2. Liquidity / market impact (0-25): prefer deep markets
+        base_size = self.settings.get("position_size_usdc", 200.0)
+        liquidity = getattr(market, "liquidity", 0) or 0
+        if liquidity > 0:
+            impact_ratio = base_size / liquidity
+            # ratio <= 0.05 -> full 25 pts; ratio >= 0.30 -> 0 pts
+            score += max(0.0, 25.0 * (1.0 - max(0.0, impact_ratio - 0.05) / 0.25))
+        else:
+            score += 5.0  # unknown liquidity: conservative
+
+        # 3. Time to expiry (0-15): more time for thesis to play out
+        days_left = self._days_to_expiry(getattr(market, "end_date", ""))
+        if days_left is None:
+            score += 10.0  # open-ended
+        else:
+            max_days = self.settings.get("max_days_to_expiry", 60)
+            score += min(15.0, max(0.0, days_left / max_days * 15.0))
+
+        # 4. Research quality (0-15): fresh news = better informed fade
+        score += min(15.0, len(news_summary) * 3.0)
+
+        # 5. Category concentration penalty (0-10)
+        category = getattr(market, "category", "") or "unknown"
+        cat_count = open_categories.get(category, 0)
+        score -= min(10.0, cat_count * 5.0)
+
+        return round(max(0.0, min(100.0, score)), 1)
+
     def run_cycle(self) -> dict:
         """
         Executes one full bot cycle. Returns a run summary dict.
@@ -347,6 +417,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
                     # Refresh current price from live market data before any decision
                     mkt = mkt_map.get(market_id)
+                    close_liquidity = getattr(mkt, 'liquidity', None) if mkt else None
                     live_price = pos.get("current_price", entry_p)
                     if mkt:
                         token_id = mkt.yes_token_id if side == "YES" else mkt.no_token_id
@@ -355,10 +426,10 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                             if fetched is not None:
                                 live_price = fetched
                                 self.trader.update_position_price(market_id, live_price)
-                                # Recalculate pnl with live price
+                                # Recalculate NET pnl with live price (includes closing fee)
                                 shares = pos.get("shares", 0)
                                 live_value = shares * live_price
-                                pnl_pct = (live_value - pos["cost_basis"]) / pos["cost_basis"] if pos["cost_basis"] > 0 else 0
+                                pnl_pct = (live_value * (1 - FEE_RATE) - pos["cost_basis"]) / pos["cost_basis"] if pos["cost_basis"] > 0 else 0
 
                     # Auto-close if market end_date has passed (+ 4h grace)
                     try:
@@ -370,7 +441,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 end_dt = end_dt.replace(tzinfo=timezone.utc)
                             if end_dt and datetime.now(timezone.utc) > end_dt + timedelta(hours=4):
                                 log(f"⏰ Market expired on {end_date_str[:10]}: {pos['question'][:50]}")
-                                self.trader.close_position(market_id, live_price, reason="expired")
+                                self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="expired")
                                 trades_closed += 1
                                 continue
                     except Exception:
@@ -382,7 +453,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                         days_open = (datetime.now(timezone.utc) - opened_at).days
                         if days_open >= 14:
                             log(f"⏰ Closing zombie position ({days_open}d): {pos['question'][:50]}")
-                            self.trader.close_position(market_id, live_price, reason="expired")
+                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="expired")
                             trades_closed += 1
                             continue
                     except Exception:
@@ -401,7 +472,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 days_left = (end_dt - datetime.now(timezone.utc)).days
                                 if days_left <= pre_lock_days:
                                     log(f"🔒 Pre-expiry lock ({days_left}d left, +{pnl_pct*100:.1f}%): {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, live_price, reason="pre_expiry_lock")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="pre_expiry_lock")
                                     trades_closed += 1
                                     continue
                     except Exception:
@@ -438,7 +509,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 move_pp = no_price - no_at_entry
                         if dominant_moved:
                             log(f"🚨 HARD STOP: dominant side moved +{move_pp*100:.1f}pp against us — {pos['question'][:50]}")
-                            self.trader.close_position(market_id, live_price, reason="hard_stop")
+                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="hard_stop")
                             trades_closed += 1
                             continue
 
@@ -461,19 +532,19 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 if side == "YES" and curr_p < entry_p:
                                     # YES went down (market favors NO more) — against us
                                     log(f"💤 Stale+against ({days_open}d, YES fell {movement*100:.1f}%) — cutting: {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, live_price, reason="stale")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="stale")
                                     trades_closed += 1
                                     continue
                                 elif side == "NO" and curr_p < entry_p:
                                     # NO went down (market favors YES more) — against us
                                     log(f"💤 Stale+against ({days_open}d, NO fell {movement*100:.1f}%) — cutting: {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, live_price, reason="stale")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="stale")
                                     trades_closed += 1
                                     continue
                                 elif movement < stale_move:
                                     # No significant movement at all — free capital
                                     log(f"💤 Stale trade ({days_open}d, {movement*100:.1f}% move) — freeing capital: {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, live_price, reason="stale")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="stale")
                                     trades_closed += 1
                                     continue
                     except Exception:
@@ -482,7 +553,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                     if pnl_pct >= tp:
                         log(f"✅ TP hit on {pos['question'][:50]} (+{pnl_pct*100:.1f}%) — closing")
                         try:
-                            self.trader.close_position(market_id, live_price, reason="take_profit")
+                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="take_profit")
                             trades_closed += 1
                         except Exception as e:
                             log(f"Close error: {e}", "error")
@@ -490,7 +561,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                     elif pnl_pct <= sl:
                         log(f"🛑 SL hit on {pos['question'][:50]} ({pnl_pct*100:.1f}%) — closing")
                         try:
-                            self.trader.close_position(market_id, live_price, reason="stop_loss")
+                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="stop_loss")
                             trades_closed += 1
                         except Exception as e:
                             log(f"Close error: {e}", "error")
@@ -514,6 +585,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                 log(f"Insufficient balance (${balance:.2f}) — skipping new trades")
             elif drawdown >= max_dd_pause:
                 log(f"🛑 DRAWDOWN PAUSE: dd={drawdown*100:.1f}% ≥ {max_dd_pause*100:.1f}% — no new entries")
+                # also reduce heat: don't compound damage while paused
             elif heat >= max_heat:
                 log(f"🛑 HEAT LIMIT: {heat*100:.1f}% of portfolio at risk ≥ {max_heat*100:.1f}% — no new entries")
             else:
@@ -548,6 +620,12 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
                 # Pre-build excluded keywords list (lower-cased once per cycle)
                 excluded_kw = [kw.lower() for kw in self.settings.get("excluded_market_keywords", [])]
+
+                # Track category concentration for diversification limit
+                open_categories: dict[str, int] = {}
+                for pos in open_pos.values():
+                    cat = pos.get("category", "") or "unknown"
+                    open_categories[cat] = open_categories.get(cat, 0) + 1
 
                 for market in markets:
                     if market.id in open_pos:
@@ -621,8 +699,10 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                             pass
 
                     # === NUEVO: Filtro de extremos (contrarian) ===
-                    # Si ambos lados están entre 15% y 85%, SKIP. No hay edge contrarian.
-                    if (0.15 < market.yes_price < 0.80) and (0.15 < market.no_price < 0.80):
+                    # Mercados donde ningún lado supera el ~80% no ofrecen suficiente
+                    # edge contrarian. Como YES + NO ≈ 1, basta con comprobar YES.
+                    # Esto es simétrico: bloquea YES entre 20% y 80%.
+                    if 0.20 < market.yes_price < 0.80:
                         log(f"   ⏭️ Skip middle range (YES={market.yes_price:.2%}, NO={market.no_price:.2%}) — no contrarian edge")
                         continue
 
@@ -725,10 +805,50 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                         }))
                         continue
 
+                    # === Composite score + diversification ===
+                    category = getattr(market, "category", "") or "unknown"
+                    max_per_cat = self.settings.get("max_positions_per_category", 2)
+                    if open_categories.get(category, 0) >= max_per_cat:
+                        log(f"   🚫 Category '{category}' limit ({max_per_cat}) reached — skip")
+                        logger.info(json.dumps({
+                            "event": "CONTRARIAN_EVAL",
+                            "market_id": market.id,
+                            "question": market.question[:80],
+                            "yes_price": round(market.yes_price, 4),
+                            "no_price": round(market.no_price, 4),
+                            "side": side,
+                            "disruption": False,
+                            "edge": round(edge, 4),
+                            "size": 0,
+                            "decision": "SKIP",
+                            "reason": "category limit",
+                        }))
+                        continue
+
+                    score = self._score_opportunity(market, edge, news_summary, open_categories)
+                    min_score = self.settings.get("min_opportunity_score", 50.0)
+                    if score < min_score:
+                        log(f"   📉 Opportunity score {score} < {min_score} — skip")
+                        logger.info(json.dumps({
+                            "event": "CONTRARIAN_EVAL",
+                            "market_id": market.id,
+                            "question": market.question[:80],
+                            "yes_price": round(market.yes_price, 4),
+                            "no_price": round(market.no_price, 4),
+                            "side": side,
+                            "disruption": False,
+                            "edge": round(edge, 4),
+                            "score": score,
+                            "size": 0,
+                            "decision": "SKIP",
+                            "reason": "low opportunity score",
+                        }))
+                        continue
+
                     log(
                         f"   ✅ CONTRARIAN EDGE: {side} | "
                         f"extreme={'YES' if market.yes_price > 0.80 else 'NO'} "
-                        f"edge={edge:.3f} disruption={disruption}"
+                        f"edge={edge:.3f} score={score} disruption={disruption}"
                     )
 
                     try:
@@ -749,11 +869,16 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
 
                         dynamic_size = round(base_size * multiplier)
 
-                        # Drawdown reduction: if down >10%, halve sizing
-                        dd_reduce = self.settings.get("drawdown_reduce_sizing_pct", 0.10)
-                        if drawdown >= dd_reduce:
+                        # Progressive drawdown reduction
+                        dd_soft = self.settings.get("dd_soft_reduce_pct", 0.05)
+                        dd_soft_factor = self.settings.get("dd_soft_reduce_factor", 0.75)
+                        dd_hard = self.settings.get("drawdown_reduce_sizing_pct", 0.10)
+                        if drawdown >= dd_hard:
                             dynamic_size = round(dynamic_size * 0.5)
                             log(f"   📉 Sizing halved: drawdown {drawdown*100:.1f}%")
+                        elif drawdown >= dd_soft:
+                            dynamic_size = round(dynamic_size * dd_soft_factor)
+                            log(f"   📉 Sizing reduced 25%: drawdown {drawdown*100:.1f}%")
 
                         # CAP: max 5% of total portfolio value per position
                         portfolio_stats = self.db.get_stats()
@@ -775,10 +900,13 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                             confidence=confidence,
                             reasoning=f"Extreme contrarian: fade {'YES' if market.yes_price > 0.80 else 'NO'} consensus @ {edge:.1%} excess. News: {'; '.join(news_summary[:3])}",
                             end_date=market.end_date,
+                            liquidity=market.liquidity,
+                            category=market.category,
                         )
                         trades_opened += 1
-                        # Update in-memory open_pos to prevent re-entry in same cycle
-                        open_pos[market.id] = {"entry_price": entry_price}
+                        # Update in-memory open_pos and category count to prevent re-entry in same cycle
+                        open_pos[market.id] = {"entry_price": entry_price, "category": market.category}
+                        open_categories[category] = open_categories.get(category, 0) + 1
                         effective_mult = round(size / base_size, 2) if base_size > 0 else 0
                         log(f"   💰 Position opened: {side} ${size:.0f} (x{effective_mult}) @ {entry_price:.4f}")
                         logger.info(json.dumps({
@@ -790,6 +918,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                             "side": side,
                             "disruption": False,
                             "edge": round(edge, 4),
+                            "score": score,
                             "size": size,
                             "decision": "OPEN",
                             "reason": "extreme contrarian, no disruption",
@@ -861,10 +990,51 @@ def get_bot_status() -> dict:
     global _bot_thread
     running = _bot_thread is not None and _bot_thread.is_alive()
     settings = load_settings()
+
+    # Live portfolio health metrics
+    try:
+        db = PortfolioDatabase()
+        stats = db.get_stats()
+        equity = db.get_equity_history()
+        portfolio = db.get_portfolio()
+
+        peak = max((e.get("value", 0) for e in equity), default=stats.get("total_value", 0))
+        current = stats.get("total_value", 0)
+        drawdown = (peak - current) / peak if peak > 0 else 0.0
+
+        positions = portfolio.get("positions", {})
+        heat = (
+            sum(p.get("cost_basis", 0) for p in positions.values()) / current
+            if current > 0 else 0.0
+        )
+
+        alerts = []
+        if drawdown >= settings.get("max_drawdown_pause_pct", 0.20):
+            alerts.append({"level": "critical", "msg": f"Drawdown pause active: {drawdown*100:.1f}%"})
+        elif drawdown >= settings.get("drawdown_reduce_sizing_pct", 0.10):
+            alerts.append({"level": "warning", "msg": f"Drawdown elevated: {drawdown*100:.1f}%"})
+        if heat >= settings.get("max_portfolio_risk_pct", 0.20):
+            alerts.append({"level": "warning", "msg": f"Heat limit reached: {heat*100:.1f}%"})
+        if stats.get("win_rate", 0) < 30 and stats.get("closed_trades", 0) >= 10:
+            alerts.append({"level": "warning", "msg": f"Win rate low: {stats.get('win_rate', 0)}%"})
+        if stats.get("open_positions", 0) >= settings.get("max_open_positions", 5):
+            alerts.append({"level": "info", "msg": "Max open positions reached"})
+
+        health = {
+            "stats": stats,
+            "drawdown": round(drawdown, 4),
+            "heat": round(heat, 4),
+            "peak_equity": round(peak, 2),
+            "alerts": alerts,
+        }
+    except Exception as e:
+        health = {"error": str(e)}
+
     return {
         "running": running,
         "settings": settings,
         "last_run": (get_runs(1) or [None])[0],
+        "health": health,
     }
 
 

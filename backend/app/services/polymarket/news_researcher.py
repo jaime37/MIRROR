@@ -18,7 +18,7 @@ logger = get_logger("mirofish.polymarket.researcher")
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
-ANALYSIS_PROMPT = """You are a prediction market analyst. Today is April 2025.
+ANALYSIS_PROMPT = """You are a prediction market analyst. Today is {today}.
 
 You are given a Polymarket YES/NO question and some web search results.
 
@@ -43,7 +43,7 @@ Respond ONLY with valid JSON — no markdown, no extra text:
   "key_facts": ["<fact 1>", "<fact 2>", "<fact 3>"]
 }"""
 
-FALLBACK_PROMPT = """You are a prediction market analyst. Today is April 2025.
+FALLBACK_PROMPT = """You are a prediction market analyst. Today is {today}.
 
 You are given a Polymarket YES/NO question. No web search results are available.
 
@@ -186,9 +186,14 @@ class NewsResearcher:
 
     # ── LLM analysis ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _today_str() -> str:
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     def _analyze_with_news(self, question: str, news_text: str) -> dict:
         messages = [
-            {"role": "system", "content": ANALYSIS_PROMPT},
+            {"role": "system", "content": ANALYSIS_PROMPT.replace("{today}", self._today_str())},
             {
                 "role": "user",
                 "content": f"**Market question:** {question}\n\n**Search results:**\n\n{news_text}",
@@ -198,7 +203,7 @@ class NewsResearcher:
 
     def _analyze_no_news(self, question: str) -> dict:
         messages = [
-            {"role": "system", "content": FALLBACK_PROMPT},
+            {"role": "system", "content": FALLBACK_PROMPT.replace("{today}", self._today_str())},
             {"role": "user", "content": f"**Market question:** {question}"},
         ]
         return self._llm_json(messages)
@@ -241,8 +246,10 @@ class NewsResearcher:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _build_query(self, question: str) -> str:
+        from datetime import datetime, timezone
         q = question[:100].strip()
-        return f"{q} 2025"
+        year = datetime.now(timezone.utc).year
+        return f"{q} {year}"
 
     def _format_snippets(self, snippets: list[dict]) -> str:
         lines = []

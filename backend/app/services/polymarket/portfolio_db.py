@@ -1,101 +1,377 @@
 """
-JSON-based persistence layer for paper trading portfolio state.
-Stores trades, positions, and equity snapshots in uploads/paper_trading/.
+Persistence layer for paper trading portfolio state.
+
+Uses SQLite with WAL mode for transactional safety. On first run, existing
+JSON files (legacy) are automatically migrated into the database.
 """
 
 import json
 import os
+import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "../../../uploads/paper_trading")
 
-
-def _ensure_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-
-def _path(filename: str) -> str:
-    _ensure_dir()
-    return os.path.join(DATA_DIR, filename)
+# Legacy JSON filenames (used for one-time migration)
+PORTFOLIO_FILE = "portfolio.json"
+TRADES_FILE = "trades.json"
+EQUITY_FILE = "equity_history.json"
 
 
-def _load(filename: str, default) -> any:
-    p = _path(filename)
-    if not os.path.exists(p):
-        return default
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save(filename: str, data: any):
-    with open(_path(filename), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def _db_file() -> str:
+    # Resolved at call time so tests can monkeypatch DATA_DIR
+    return os.path.join(DATA_DIR, "portfolio.db")
 
 
 class PortfolioDatabase:
-    PORTFOLIO_FILE = "portfolio.json"
-    TRADES_FILE = "trades.json"
-    EQUITY_FILE = "equity_history.json"
-
     INITIAL_BALANCE = 10_000.0  # starting virtual USDC
 
-    # ---------- Portfolio ----------
+    def __init__(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        json_portfolio = os.path.join(DATA_DIR, PORTFOLIO_FILE)
+        needs_migration = not os.path.exists(self._db_path()) and os.path.exists(json_portfolio)
+        self._init_db()
+        if needs_migration:
+            self._migrate_json_if_needed()
+
+    # ── Connection ──────────────────────────────────────────────────────────────
+
+    def _db_path(self) -> str:
+        return _db_file()
+
+    @contextmanager
+    def _conn(self):
+        conn = sqlite3.connect(self._db_path(), timeout=10.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    # ── Schema ──────────────────────────────────────────────────────────────────
+
+    def _init_db(self):
+        with self._conn() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS portfolio (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    balance REAL NOT NULL,
+                    initial_balance REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS positions (
+                    market_id TEXT PRIMARY KEY,
+                    question TEXT,
+                    side TEXT,
+                    entry_price REAL,
+                    midpoint_price REAL,
+                    category TEXT,
+                    shares REAL,
+                    cost_basis REAL,
+                    fee_paid REAL,
+                    liquidity REAL,
+                    current_price REAL,
+                    current_value REAL,
+                    unrealized_pnl REAL,
+                    estimated_prob REAL,
+                    confidence TEXT,
+                    reasoning TEXT,
+                    simulation_id TEXT,
+                    report_id TEXT,
+                    opened_at TEXT,
+                    end_date TEXT,
+                    status TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS trades (
+                    pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id TEXT NOT NULL,
+                    type TEXT,
+                    market_id TEXT,
+                    question TEXT,
+                    side TEXT,
+                    price REAL,
+                    midpoint_price REAL,
+                    entry_price REAL,
+                    exit_price REAL,
+                    exit_midpoint REAL,
+                    shares REAL,
+                    amount_usdc REAL,
+                    proceeds REAL,
+                    fee REAL,
+                    pnl REAL,
+                    pnl_pct REAL,
+                    estimated_prob REAL,
+                    confidence TEXT,
+                    reasoning TEXT,
+                    category TEXT,
+                    simulation_id TEXT,
+                    report_id TEXT,
+                    reason TEXT,
+                    opened_at TEXT,
+                    timestamp TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
+                CREATE INDEX IF NOT EXISTS idx_trades_type ON trades(type);
+
+                CREATE TABLE IF NOT EXISTS equity_history (
+                    timestamp TEXT PRIMARY KEY,
+                    value REAL NOT NULL
+                );
+                """
+            )
+
+    # ── JSON migration (one-time) ───────────────────────────────────────────────
+
+    def _migrate_json_if_needed(self):
+        """Import legacy JSON files into the newly-created SQLite database."""
+        portfolio_path = os.path.join(DATA_DIR, PORTFOLIO_FILE)
+        trades_path = os.path.join(DATA_DIR, TRADES_FILE)
+        equity_path = os.path.join(DATA_DIR, EQUITY_FILE)
+
+        if not os.path.exists(portfolio_path):
+            return
+
+        try:
+            with open(portfolio_path, "r", encoding="utf-8") as f:
+                portfolio = json.load(f)
+        except Exception:
+            return
+
+        self.save_portfolio(portfolio)
+
+        if os.path.exists(trades_path):
+            try:
+                with open(trades_path, "r", encoding="utf-8") as f:
+                    trades = json.load(f)
+                for trade in trades:
+                    self.add_trade(trade)
+            except Exception:
+                pass
+
+        if os.path.exists(equity_path):
+            try:
+                with open(equity_path, "r", encoding="utf-8") as f:
+                    equity = json.load(f)
+                for row in equity:
+                    self.record_equity(row.get("value", 0), timestamp=row.get("timestamp"))
+            except Exception:
+                pass
+
+    # ── Portfolio ───────────────────────────────────────────────────────────────
 
     def get_portfolio(self) -> dict:
-        default = {
-            "balance": self.INITIAL_BALANCE,
-            "initial_balance": self.INITIAL_BALANCE,
-            "positions": {},  # market_id -> position dict
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        return _load(self.PORTFOLIO_FILE, default)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT balance, initial_balance, created_at FROM portfolio WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                return {
+                    "balance": self.INITIAL_BALANCE,
+                    "initial_balance": self.INITIAL_BALANCE,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "positions": {},
+                }
+
+            positions = {}
+            for pos in conn.execute("SELECT * FROM positions"):
+                positions[pos["market_id"]] = dict(pos)
+
+            return {
+                "balance": row["balance"],
+                "initial_balance": row["initial_balance"],
+                "created_at": row["created_at"],
+                "positions": positions,
+            }
 
     def save_portfolio(self, portfolio: dict):
-        _save(self.PORTFOLIO_FILE, portfolio)
+        with self._conn() as conn:
+            conn.execute(
+                """
+                REPLACE INTO portfolio (id, balance, initial_balance, created_at)
+                VALUES (1, ?, ?, ?)
+                """,
+                (
+                    portfolio.get("balance", self.INITIAL_BALANCE),
+                    portfolio.get("initial_balance", self.INITIAL_BALANCE),
+                    portfolio.get("created_at", datetime.now(timezone.utc).isoformat()),
+                ),
+            )
+            conn.execute("DELETE FROM positions")
+            for market_id, pos in portfolio.get("positions", {}).items():
+                conn.execute(
+                    """
+                    INSERT INTO positions (
+                        market_id, question, side, entry_price, midpoint_price, category,
+                        shares, cost_basis, fee_paid, liquidity, current_price, current_value,
+                        unrealized_pnl, estimated_prob, confidence, reasoning, simulation_id,
+                        report_id, opened_at, end_date, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        market_id,
+                        pos.get("question", ""),
+                        pos.get("side", ""),
+                        pos.get("entry_price", 0),
+                        pos.get("midpoint_price", 0),
+                        pos.get("category", ""),
+                        pos.get("shares", 0),
+                        pos.get("cost_basis", 0),
+                        pos.get("fee_paid", 0),
+                        pos.get("liquidity", 0),
+                        pos.get("current_price", 0),
+                        pos.get("current_value", 0),
+                        pos.get("unrealized_pnl", 0),
+                        pos.get("estimated_prob", 0),
+                        pos.get("confidence", ""),
+                        pos.get("reasoning", ""),
+                        pos.get("simulation_id", ""),
+                        pos.get("report_id", ""),
+                        pos.get("opened_at", ""),
+                        pos.get("end_date", ""),
+                        pos.get("status", ""),
+                    ),
+                )
 
     def reset_portfolio(self):
+        now = datetime.now(timezone.utc).isoformat()
         portfolio = {
             "balance": self.INITIAL_BALANCE,
             "initial_balance": self.INITIAL_BALANCE,
+            "created_at": now,
             "positions": {},
-            "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        _save(self.PORTFOLIO_FILE, portfolio)
-        _save(self.TRADES_FILE, [])
-        _save(self.EQUITY_FILE, [])
+        self.save_portfolio(portfolio)
+        with self._conn() as conn:
+            conn.execute("DELETE FROM trades")
+            conn.execute("DELETE FROM equity_history")
 
-    # ---------- Trades ----------
+    # ── Trades ──────────────────────────────────────────────────────────────────
 
     def get_trades(self) -> list:
-        return _load(self.TRADES_FILE, [])
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades ORDER BY pk"
+            ).fetchall()
+            return [self._row_to_trade(row) for row in rows]
 
     def add_trade(self, trade: dict) -> dict:
-        trade["id"] = str(uuid.uuid4())[:8]
-        trade["timestamp"] = datetime.now(timezone.utc).isoformat()
-        trades = self.get_trades()
-        trades.append(trade)
-        _save(self.TRADES_FILE, trades)
+        trade = dict(trade)
+        if "id" not in trade or not trade["id"]:
+            trade["id"] = str(uuid.uuid4())[:8]
+        if "timestamp" not in trade or not trade["timestamp"]:
+            trade["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO trades (
+                    trade_id, type, market_id, question, side, price, midpoint_price,
+                    entry_price, exit_price, exit_midpoint, shares, amount_usdc, proceeds,
+                    fee, pnl, pnl_pct, estimated_prob, confidence, reasoning, category,
+                    simulation_id, report_id, reason, opened_at, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade.get("id", ""),
+                    trade.get("type", ""),
+                    trade.get("market_id", ""),
+                    trade.get("question", ""),
+                    trade.get("side", ""),
+                    trade.get("price", 0),
+                    trade.get("midpoint_price", 0),
+                    trade.get("entry_price", 0),
+                    trade.get("exit_price", 0),
+                    trade.get("exit_midpoint", 0),
+                    trade.get("shares", 0),
+                    trade.get("amount_usdc", 0),
+                    trade.get("proceeds", 0),
+                    trade.get("fee", 0),
+                    trade.get("pnl", 0),
+                    trade.get("pnl_pct", 0),
+                    trade.get("estimated_prob", 0),
+                    trade.get("confidence", ""),
+                    trade.get("reasoning", ""),
+                    trade.get("category", ""),
+                    trade.get("simulation_id", ""),
+                    trade.get("report_id", ""),
+                    trade.get("reason", ""),
+                    trade.get("opened_at", ""),
+                    trade.get("timestamp", ""),
+                ),
+            )
         return trade
 
-    # ---------- Equity history ----------
+    @staticmethod
+    def _row_to_trade(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["trade_id"],
+            "type": row["type"],
+            "market_id": row["market_id"],
+            "question": row["question"],
+            "side": row["side"],
+            "price": row["price"],
+            "midpoint_price": row["midpoint_price"],
+            "entry_price": row["entry_price"],
+            "exit_price": row["exit_price"],
+            "exit_midpoint": row["exit_midpoint"],
+            "shares": row["shares"],
+            "amount_usdc": row["amount_usdc"],
+            "proceeds": row["proceeds"],
+            "fee": row["fee"],
+            "pnl": row["pnl"],
+            "pnl_pct": row["pnl_pct"],
+            "estimated_prob": row["estimated_prob"],
+            "confidence": row["confidence"],
+            "reasoning": row["reasoning"],
+            "category": row["category"],
+            "simulation_id": row["simulation_id"],
+            "report_id": row["report_id"],
+            "reason": row["reason"],
+            "opened_at": row["opened_at"],
+            "timestamp": row["timestamp"],
+        }
+
+    # ── Equity history ──────────────────────────────────────────────────────────
 
     def get_equity_history(self) -> list:
-        return _load(self.EQUITY_FILE, [])
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT timestamp, value FROM equity_history ORDER BY timestamp"
+            ).fetchall()
+            return [{"timestamp": r["timestamp"], "value": r["value"]} for r in rows]
 
-    def record_equity(self, total_value: float):
-        history = self.get_equity_history()
-        history.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "value": round(total_value, 4),
-        })
-        # keep last 2000 snapshots
-        if len(history) > 2000:
-            history = history[-2000:]
-        _save(self.EQUITY_FILE, history)
+    def record_equity(self, total_value: float, timestamp: Optional[str] = None):
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO equity_history (timestamp, value) VALUES (?, ?)",
+                (timestamp, round(total_value, 4)),
+            )
+            # keep last 2000 snapshots
+            conn.execute(
+                """
+                DELETE FROM equity_history
+                WHERE timestamp NOT IN (
+                    SELECT timestamp FROM equity_history ORDER BY timestamp DESC LIMIT 2000
+                )
+                """
+            )
 
-    # ---------- Stats ----------
+    # ── Stats ───────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
         trades = self.get_trades()
@@ -122,14 +398,12 @@ class PortfolioDatabase:
         initial = portfolio.get("initial_balance", self.INITIAL_BALANCE)
         current_balance = portfolio.get("balance", initial)
 
-        # estimate open positions value
         positions_value = sum(
             pos.get("current_value", pos.get("cost_basis", 0))
             for pos in portfolio.get("positions", {}).values()
         )
         total_value = current_balance + positions_value
 
-        # unrealized PnL from open positions (so total_pnl reflects true profit)
         unrealized_pnl = sum(
             pos.get("unrealized_pnl", 0)
             for pos in portfolio.get("positions", {}).values()

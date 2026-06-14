@@ -12,11 +12,36 @@ from ...utils.logger import get_logger
 logger = get_logger("mirofish.polymarket.paper_trader")
 
 FEE_RATE = 0.02  # 2% simulated fee per trade
+SLIPPAGE_FACTOR = 0.5  # slippage scales with order_size / liquidity
+MAX_SLIPPAGE = 0.05  # cap slippage at 5%
 
 # Module-level lock: ensures open/close operations are serialized across threads.
 # Prevents duplicate CLOSE records when the background bot and a manual trigger
 # run concurrently, or when two Railway processes start before the debounce fires.
 _position_lock = threading.Lock()
+
+
+def _apply_slippage(
+    midpoint: float,
+    amount_usdc: float,
+    liquidity: Optional[float],
+    action: str,  # "buy" or "sell"
+) -> float:
+    """
+    Returns a conservative fill price given order size and market liquidity.
+    Buying lifts the price; selling pushes it down. Low-liquidity markets pay
+    more slippage, capped at MAX_SLIPPAGE.
+    """
+    if not liquidity or liquidity <= 0:
+        return midpoint
+    ratio = amount_usdc / liquidity
+    slippage = min(MAX_SLIPPAGE, SLIPPAGE_FACTOR * ratio)
+    if action == "buy":
+        fill = midpoint * (1 + slippage)
+    else:
+        fill = midpoint * (1 - slippage)
+    # Keep price in valid (0, 1) range
+    return max(0.001, min(0.999, fill))
 
 
 class PaperTrader:
@@ -36,13 +61,15 @@ class PaperTrader:
         simulation_id: Optional[str] = None,
         report_id: Optional[str] = None,
         end_date: Optional[str] = None,
+        liquidity: Optional[float] = None,
+        category: Optional[str] = None,
     ) -> dict:
         """Opens a new paper position. Returns the trade record."""
         with _position_lock:
             return self._open_position_locked(
                 market_id, question, side, entry_price, amount_usdc,
                 estimated_prob, confidence, reasoning,
-                simulation_id, report_id, end_date,
+                simulation_id, report_id, end_date, liquidity, category,
             )
 
     def _open_position_locked(
@@ -58,6 +85,8 @@ class PaperTrader:
         simulation_id: Optional[str] = None,
         report_id: Optional[str] = None,
         end_date: Optional[str] = None,
+        liquidity: Optional[float] = None,
+        category: Optional[str] = None,
     ) -> dict:
         """Internal: caller must hold _position_lock."""
         # Re-read from disk inside the lock so we see the latest state
@@ -72,19 +101,24 @@ class PaperTrader:
         if market_id in portfolio["positions"]:
             raise ValueError(f"Position already open for market {market_id}")
 
+        # Conservative fill: buying moves the price against us
+        fill_price = _apply_slippage(entry_price, amount_usdc, liquidity, action="buy")
         fee = amount_usdc * FEE_RATE
         net_amount = amount_usdc - fee
-        shares = net_amount / entry_price if entry_price > 0 else 0
+        shares = net_amount / fill_price if fill_price > 0 else 0
 
         position = {
             "market_id": market_id,
             "question": question,
             "side": side,
-            "entry_price": round(entry_price, 4),
+            "entry_price": round(fill_price, 4),
+            "midpoint_price": round(entry_price, 4),
+            "category": category or "",
             "shares": round(shares, 4),
             "cost_basis": round(amount_usdc, 4),
             "fee_paid": round(fee, 4),
-            "current_price": round(entry_price, 4),
+            "liquidity": liquidity or 0.0,
+            "current_price": round(fill_price, 4),
             "current_value": round(net_amount, 4),
             "unrealized_pnl": round(-fee, 4),
             "estimated_prob": round(estimated_prob, 4),
@@ -106,13 +140,15 @@ class PaperTrader:
             "market_id": market_id,
             "question": question,
             "side": side,
-            "price": round(entry_price, 4),
+            "price": round(fill_price, 4),
+            "midpoint_price": round(entry_price, 4),
             "shares": round(shares, 4),
             "amount_usdc": round(amount_usdc, 4),
             "fee": round(fee, 4),
             "estimated_prob": round(estimated_prob, 4),
             "confidence": confidence,
             "reasoning": reasoning,
+            "category": category or "",
             "simulation_id": simulation_id,
             "report_id": report_id,
         })
@@ -120,7 +156,7 @@ class PaperTrader:
         self._snapshot_equity()
         logger.info(
             f"Opened paper position: {side} on '{question[:60]}' "
-            f"@ {entry_price:.4f} for {amount_usdc:.2f} USDC"
+            f"@ {fill_price:.4f} (mid {entry_price:.4f}) for {amount_usdc:.2f} USDC"
         )
         return trade
 
@@ -129,16 +165,18 @@ class PaperTrader:
         market_id: str,
         exit_price: float,
         reason: str = "manual",
+        liquidity: Optional[float] = None,
     ) -> dict:
         """Closes an open paper position at the given exit price."""
         with _position_lock:
-            return self._close_position_locked(market_id, exit_price, reason)
+            return self._close_position_locked(market_id, exit_price, reason, liquidity)
 
     def _close_position_locked(
         self,
         market_id: str,
         exit_price: float,
         reason: str = "manual",
+        liquidity: Optional[float] = None,
     ) -> dict:
         """Internal: caller must hold _position_lock."""
         # Re-read from disk inside the lock — another thread may have already
@@ -149,8 +187,12 @@ class PaperTrader:
             raise ValueError(f"No open position for market {market_id}")
 
         pos = portfolio["positions"][market_id]
-        fee = pos["shares"] * exit_price * FEE_RATE
-        proceeds = pos["shares"] * exit_price - fee
+        close_liquidity = liquidity if liquidity is not None else pos.get("liquidity", 0)
+        notional = pos["shares"] * exit_price
+        # Conservative fill: selling pushes the price against us
+        fill_price = _apply_slippage(exit_price, notional, close_liquidity, action="sell")
+        fee = pos["shares"] * fill_price * FEE_RATE
+        proceeds = pos["shares"] * fill_price - fee
         pnl = proceeds - pos["cost_basis"]
 
         # Remove position and update balance BEFORE writing the trade record.
@@ -167,7 +209,8 @@ class PaperTrader:
             "question": pos["question"],
             "side": pos["side"],
             "entry_price": pos["entry_price"],
-            "exit_price": round(exit_price, 4),
+            "exit_price": round(fill_price, 4),
+            "exit_midpoint": round(exit_price, 4),
             "shares": pos["shares"],
             "proceeds": round(proceeds, 4),
             "fee": round(fee, 4),
@@ -180,6 +223,7 @@ class PaperTrader:
         self._snapshot_equity()
         logger.info(
             f"Closed paper position on '{pos['question'][:60]}': "
+            f"fill {fill_price:.4f} (mid {exit_price:.4f}) "
             f"PnL = {pnl:+.2f} USDC ({pnl / pos['cost_basis'] * 100:+.1f}%)"
         )
         return trade

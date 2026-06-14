@@ -13,6 +13,7 @@ from ..services.polymarket.autonomous_pipeline import (
     load_settings, save_settings,
 )
 from ..services.polymarket.bot_reporter import BotReporter
+from ..services.polymarket.backtester import Backtester
 from ..services.report_agent import ReportManager
 from ..utils.logger import get_logger
 logger = get_logger("mirofish.api.polymarket")
@@ -348,4 +349,50 @@ def force_report():
         return jsonify({"success": True, "data": report})
     except Exception as e:
         logger.error(f"force_report error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------- Backtest ----------
+
+@polymarket_bp.route("/backtest/run", methods=["POST"])
+def run_backtest():
+    """
+    Runs a historical backtest of the contrarian strategy.
+    Body/Query params:
+      - limit: number of top markets to test (default 10)
+      - fidelity: CLOB history candle size in minutes (default 720 = 12h)
+      - min_volume / min_liquidity: market filters
+      - mode: "portfolio" (capital-aware) or "signal" (unconstrained, default "portfolio")
+      - initial_balance: for portfolio mode (default 10000)
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        limit = data.get("limit", request.args.get("limit", 10, type=int))
+        fidelity = data.get("fidelity", request.args.get("fidelity", 720, type=int))
+        min_volume = data.get("min_volume", request.args.get("min_volume", 5000.0, type=float))
+        min_liquidity = data.get("min_liquidity", request.args.get("min_liquidity", 1000.0, type=float))
+        mode = data.get("mode", request.args.get("mode", "portfolio"))
+        initial_balance = data.get("initial_balance", request.args.get("initial_balance", 10_000.0, type=float))
+
+        settings = load_settings()
+        backtester = Backtester(settings=settings, fidelity_minutes=fidelity)
+
+        if mode == "portfolio":
+            results = backtester.run_portfolio(
+                limit=limit,
+                min_volume=min_volume,
+                min_liquidity=min_liquidity,
+                initial_balance=initial_balance,
+            )
+        else:
+            results = backtester.run(
+                limit=limit,
+                min_volume=min_volume,
+                min_liquidity=min_liquidity,
+            )
+
+        return jsonify({"success": True, "data": results})
+    except Exception as e:
+        logger.error(f"run_backtest error: {e}")
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
