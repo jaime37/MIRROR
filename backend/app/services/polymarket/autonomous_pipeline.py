@@ -33,7 +33,7 @@ logger = get_logger("mirofish.polymarket.autonomous")
 # ── Default settings ──────────────────────────────────────────────────────────
 DEFAULT_SETTINGS = {
     "max_markets_per_cycle": 30,
-    "position_size_usdc": 200.0,       # REDUCED: 400→200 — protect damaged portfolio
+    "position_size_usdc": 150.0,       # REDUCED: 400→200→150 — smaller risk per ticket
     "min_edge": 0.10,                  # council Tier 1: stronger signal
     "min_confidence": ["high", "medium"],
     # Adaptive take-profit by entry price — let extreme contrarian outliers run
@@ -50,7 +50,7 @@ DEFAULT_SETTINGS = {
     "max_open_positions": 5,
     "min_volume": 5000,
     "min_liquidity": 1000,
-    "min_entry_price": 0.03,           # allow extreme contrarian entries (underdog >=3%)
+    "min_entry_price": 0.01,           # allow extreme contrarian entries (underdog >=1%)
     "excluded_market_keywords": [
         "nba", "nfl", "nhl", "mlb", "mls",
         "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "champions league",
@@ -71,10 +71,10 @@ DEFAULT_SETTINGS = {
     "stale_position_days": 5,          # close dead positions faster to free heat/capital
     "stale_position_movement": 0.03,
     # Tier 2: dynamic position sizing multipliers
-    "size_multiplier_high_conf_large_edge": 1.25,  # high conf + edge ≥10% → $250
-    "size_multiplier_high_conf_base": 1.00,        # high conf + edge 5-10% → $200
-    "size_multiplier_medium_conf_large_edge": 0.85,# medium conf + edge ≥10% → $170
-    "size_multiplier_medium_conf_base": 0.70,      # medium conf + edge 5-10% → $140
+    "size_multiplier_high_conf_large_edge": 1.25,  # high conf + edge ≥10% → $187.5
+    "size_multiplier_high_conf_base": 1.00,        # high conf + edge 5-10% → $150
+    "size_multiplier_medium_conf_large_edge": 0.85,# medium conf + edge ≥10% → $127.5
+    "size_multiplier_medium_conf_base": 0.70,      # medium conf + edge 5-10% → $105
     # ── RISK MANAGEMENT v3 ──
     "max_portfolio_risk_pct": 0.20,    # max 20% of portfolio at risk across open positions
     "dd_soft_reduce_pct": 0.05,        # reduce sizing 25% if drawdown >5%
@@ -119,7 +119,7 @@ def load_settings() -> dict:
     # This ensures code-level upgrades take effect even when bot_settings.json
     # has stale values from a previous deploy.
     FLOOR = {
-        "min_entry_price": 0.03,          # floor: allow extreme contrarian entries
+        "min_entry_price": 0.01,          # floor: allow extreme contrarian entries
         "min_edge": 0.10,                 # council Tier 1 — never below 10%
         "min_days_to_expiry_entry": 7,    # Tier 2 — hard block, never disable
         "pre_expiry_lock_days": 5,        # Tier 2 — protect profits, never below 5d
@@ -130,9 +130,9 @@ def load_settings() -> dict:
 
     # ── Hard overrides: these values always come from code, never from saved file ──
     HARDCODE = {
-        "position_size_usdc": 200.0,     # REDUCED — protect capital
+        "position_size_usdc": 150.0,     # REDUCED — smaller risk per lottery ticket
         "max_days_to_expiry": 60,
-        "min_entry_price": 0.03,
+        "min_entry_price": 0.01,
         "max_portfolio_risk_pct": 0.20,
         "dd_soft_reduce_pct": 0.05,
         "dd_soft_reduce_factor": 0.75,
