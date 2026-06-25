@@ -345,9 +345,9 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
         # 4. Research quality (0-15): fresh news = better informed fade
         score += min(15.0, len(news_summary) * 3.0)
 
-        # 5. Category concentration penalty (0-10)
+        # 5. Category concentration penalty (0-10) — ignore missing/unknown categories
         category = getattr(market, "category", "") or "unknown"
-        cat_count = open_categories.get(category, 0)
+        cat_count = open_categories.get(category, 0) if category not in ("", "unknown") else 0
         score -= min(10.0, cat_count * 5.0)
 
         return round(max(0.0, min(100.0, score)), 1)
@@ -808,7 +808,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                     # === Composite score + diversification ===
                     category = getattr(market, "category", "") or "unknown"
                     max_per_cat = self.settings.get("max_positions_per_category", 2)
-                    if open_categories.get(category, 0) >= max_per_cat:
+                    if category not in ("", "unknown") and open_categories.get(category, 0) >= max_per_cat:
                         log(f"   🚫 Category '{category}' limit ({max_per_cat}) reached — skip")
                         logger.info(json.dumps({
                             "event": "CONTRARIAN_EVAL",
