@@ -127,8 +127,9 @@ class BotReporter:
             alerts.append(f"🟡 DRAWDOWN: {drawdown*100:.1f}%")
         if heat >= 0.15:
             alerts.append(f"🔴 HEAT ALTO: {heat*100:.1f}% del portfolio en riesgo")
-        if open_count >= 5:
-            alerts.append("🟡 Máximo de posiciones alcanzado (5/5)")
+        max_open = settings.get("max_open_positions", 5)
+        if open_count >= max_open:
+            alerts.append(f"🟡 Máximo de posiciones alcanzado ({open_count}/{max_open})")
         if pivot_violations:
             alerts.append(f"🔴 {len(pivot_violations)} posición(es) post-pivot en rango 15%-85%")
         if len(recent_trades) > 10 and sum(1 for t in recent_trades if t.get("type") == "CLOSE" and float(t.get("pnl", 0)) < 0) > 7:
@@ -159,7 +160,7 @@ class BotReporter:
                 "total_value": round(total_value, 2),
                 "total_return_pct": round(((total_value - initial) / initial) * 100, 2),
                 "open_positions": open_count,
-                "max_positions": 5,
+                "max_positions": max_open,
             },
             "stats": {
                 "win_rate": stats.get("win_rate", 0),
