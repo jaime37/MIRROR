@@ -59,6 +59,8 @@ DEFAULT_SETTINGS = {
         "match", "vs.", " vs ", "game 1", "game 2", "game 3", "game 4", "game 5", "game 6", "game 7",
         "o/u ", "over/under", "spread",
         "lpl ", "lck ", "esports", "esport",
+        "wimbledon", "us open", "french open", "australian open", "tennis",
+        "grand slam", "atp", "wta", "fonseca",
     ],
     "stoploss_cooldown_days": 7,
     "takeprofit_cooldown_days": 3,
