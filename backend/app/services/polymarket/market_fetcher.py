@@ -166,6 +166,72 @@ class MarketFetcher:
 
         return markets
 
+    def get_order_book(self, token_id: str) -> Optional[dict]:
+        """
+        Fetches the CLOB order book for a token.
+        Returns {"bids": [(price, size), ...] sorted desc,
+                 "asks": [(price, size), ...] sorted asc} as floats.
+        None on error.
+        """
+        try:
+            resp = self.session.get(
+                f"{CLOB_API}/book",
+                params={"token_id": token_id},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            def _levels(raw) -> list:
+                levels = []
+                for lvl in raw or []:
+                    try:
+                        levels.append((float(lvl["price"]), float(lvl["size"])))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                return levels
+
+            # The API may return bids ascending — sort defensively
+            bids = sorted(_levels(data.get("bids")), key=lambda x: x[0], reverse=True)
+            asks = sorted(_levels(data.get("asks")), key=lambda x: x[0])
+            return {"bids": bids, "asks": asks}
+        except Exception:
+            return None
+
+    def best_bid_ask(self, token_id: str) -> Optional[tuple[float, float]]:
+        """Returns (best_bid, best_ask) for a token, or None if unavailable."""
+        book = self.get_order_book(token_id)
+        if not book or not book["bids"] or not book["asks"]:
+            return None
+        return book["bids"][0][0], book["asks"][0][0]
+
+    def get_market_resolution(self, market_id: str) -> Optional[str]:
+        """
+        Returns "YES"/"NO" if the market is closed and fully resolved,
+        None otherwise (open, or still inside the UMA resolution window).
+        """
+        try:
+            resp = self.session.get(
+                f"{GAMMA_API}/markets/{market_id}",
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            m = resp.json()
+            if not m.get("closed"):
+                return None
+            prices_raw = m.get("outcomePrices") or "[]"
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            if len(prices) < 2:
+                return None
+            yes_p, no_p = float(prices[0]), float(prices[1])
+            if yes_p > 0.99 and no_p < 0.01:
+                return "YES"
+            if no_p > 0.99 and yes_p < 0.01:
+                return "NO"
+            return None
+        except Exception:
+            return None
+
     def get_market_price(self, token_id: str) -> Optional[float]:
         """Fetches current midpoint price for a token via CLOB API."""
         try:

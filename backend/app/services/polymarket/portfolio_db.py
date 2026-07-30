@@ -120,6 +120,9 @@ class PortfolioDatabase:
                     report_id TEXT,
                     reason TEXT,
                     opened_at TEXT,
+                    settings_version TEXT,
+                    entry_bucket TEXT,
+                    execution_mode TEXT,
                     timestamp TEXT NOT NULL
                 );
 
@@ -130,8 +133,46 @@ class PortfolioDatabase:
                     timestamp TEXT PRIMARY KEY,
                     value REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS prob_estimates (
+                    pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                    estimate_id TEXT,
+                    market_id TEXT,
+                    question TEXT,
+                    side TEXT,
+                    estimated_prob REAL,
+                    confidence TEXT,
+                    edge REAL,
+                    market_price REAL,
+                    as_of TEXT,
+                    model TEXT,
+                    prompt_version TEXT,
+                    settings_version TEXT,
+                    outcome REAL,
+                    brier REAL,
+                    created_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS position_marks (
+                    pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_id TEXT,
+                    ts TEXT,
+                    price REAL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_position_marks_market_id ON position_marks(market_id);
                 """
             )
+            # Idempotent migrations for databases created before these columns existed
+            for stmt in (
+                "ALTER TABLE trades ADD COLUMN settings_version TEXT",
+                "ALTER TABLE trades ADD COLUMN entry_bucket TEXT",
+                "ALTER TABLE trades ADD COLUMN execution_mode TEXT",
+            ):
+                try:
+                    conn.execute(stmt)
+                except Exception:
+                    pass  # column already exists
 
     # ── JSON migration (one-time) ───────────────────────────────────────────────
 
@@ -281,8 +322,9 @@ class PortfolioDatabase:
                     trade_id, type, market_id, question, side, price, midpoint_price,
                     entry_price, exit_price, exit_midpoint, shares, amount_usdc, proceeds,
                     fee, pnl, pnl_pct, estimated_prob, confidence, reasoning, category,
-                    simulation_id, report_id, reason, opened_at, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    simulation_id, report_id, reason, opened_at,
+                    settings_version, entry_bucket, execution_mode, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.get("id", ""),
@@ -309,6 +351,9 @@ class PortfolioDatabase:
                     trade.get("report_id", ""),
                     trade.get("reason", ""),
                     trade.get("opened_at", ""),
+                    trade.get("settings_version", ""),
+                    trade.get("entry_bucket", ""),
+                    trade.get("execution_mode", ""),
                     trade.get("timestamp", ""),
                 ),
             )
@@ -341,8 +386,100 @@ class PortfolioDatabase:
             "report_id": row["report_id"],
             "reason": row["reason"],
             "opened_at": row["opened_at"],
+            "settings_version": row["settings_version"],
+            "entry_bucket": row["entry_bucket"],
+            "execution_mode": row["execution_mode"],
             "timestamp": row["timestamp"],
         }
+
+    # ── Probability estimates (calibration) ─────────────────────────────────────
+
+    def add_prob_estimate(self, d: dict) -> dict:
+        d = dict(d)
+        if "estimate_id" not in d or not d["estimate_id"]:
+            d["estimate_id"] = str(uuid.uuid4())[:8]
+        if "created_at" not in d or not d["created_at"]:
+            d["created_at"] = datetime.now(timezone.utc).isoformat()
+
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO prob_estimates (
+                    estimate_id, market_id, question, side, estimated_prob, confidence,
+                    edge, market_price, as_of, model, prompt_version, settings_version,
+                    outcome, brier, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    d.get("estimate_id", ""),
+                    d.get("market_id", ""),
+                    d.get("question", ""),
+                    d.get("side", ""),
+                    d.get("estimated_prob", 0),
+                    d.get("confidence", ""),
+                    d.get("edge", 0),
+                    d.get("market_price", 0),
+                    d.get("as_of", ""),
+                    d.get("model", ""),
+                    d.get("prompt_version", ""),
+                    d.get("settings_version", ""),
+                    d.get("outcome"),
+                    d.get("brier"),
+                    d.get("created_at", ""),
+                ),
+            )
+        return d
+
+    def get_prob_estimates(self, market_id: Optional[str] = None) -> list:
+        with self._conn() as conn:
+            if market_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM prob_estimates WHERE market_id = ? ORDER BY pk",
+                    (market_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM prob_estimates ORDER BY pk").fetchall()
+            return [dict(r) for r in rows]
+
+    def resolve_prob_estimates(self, market_id: str, outcome: float) -> int:
+        """
+        Marks all unresolved estimates for a market with the outcome FOR THE
+        POSITION'S SIDE (1.0 if the side won, 0.0 otherwise) and computes
+        brier = (estimated_prob - outcome)^2. Returns rows resolved.
+        """
+        resolved = 0
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT pk, estimated_prob FROM prob_estimates WHERE market_id = ? AND outcome IS NULL",
+                (market_id,),
+            ).fetchall()
+            for row in rows:
+                brier = (row["estimated_prob"] - outcome) ** 2
+                conn.execute(
+                    "UPDATE prob_estimates SET outcome = ?, brier = ? WHERE pk = ?",
+                    (outcome, brier, row["pk"]),
+                )
+                resolved += 1
+        return resolved
+
+    # ── Position marks (observability) ──────────────────────────────────────────
+
+    def add_position_mark(self, market_id: str, price: float, ts: Optional[str] = None):
+        if ts is None:
+            ts = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO position_marks (market_id, ts, price) VALUES (?, ?, ?)",
+                (market_id, ts, round(price, 4)),
+            )
+
+    def get_position_marks(self, market_id: str) -> list:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT market_id, ts, price FROM position_marks WHERE market_id = ? ORDER BY pk",
+                (market_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     # ── Equity history ──────────────────────────────────────────────────────────
 

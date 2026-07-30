@@ -10,7 +10,7 @@ Flow per cycle:
   6. Refresh prices of existing open positions
   7. Auto-close positions that hit take-profit or stop-loss thresholds
 
-Everything is saved to portfolio_db (JSON files, no extra DB needed).
+Everything is saved to portfolio_db (SQLite with WAL mode).
 """
 
 import json
@@ -23,12 +23,37 @@ from typing import Optional
 
 from .market_fetcher import MarketFetcher
 from .news_researcher import NewsResearcher
-from .paper_trader import PaperTrader, FEE_RATE
+from .paper_trader import PaperTrader, taker_fee
 from .portfolio_db import PortfolioDatabase
 from .bot_reporter import BotReporter
 from ...utils.logger import get_logger
 
 logger = get_logger("mirofish.polymarket.autonomous")
+
+# Bumped whenever strategy/settings semantics change — stamped on OPEN trades
+# and prob_estimates rows so results can be attributed to a config generation.
+SETTINGS_VERSION = "v5-swarm-2026-07-30"
+
+
+def entry_bucket(price: float) -> str:
+    """Bucket label for an entry price, used for per-bucket calibration stats."""
+    if price < 0.05:
+        return "0-0.05"
+    if price < 0.10:
+        return "0.05-0.10"
+    if price < 0.20:
+        return "0.10-0.20"
+    if price < 0.30:
+        return "0.20-0.30"
+    if price < 0.70:
+        return "0.30-0.70"
+    if price < 0.80:
+        return "0.70-0.80"
+    if price < 0.90:
+        return "0.80-0.90"
+    if price < 0.95:
+        return "0.90-0.95"
+    return "0.95-1"
 
 # ── Default settings ──────────────────────────────────────────────────────────
 DEFAULT_SETTINGS = {
@@ -41,11 +66,14 @@ DEFAULT_SETTINGS = {
     "tp_under_10": 0.50,               # entry < 10% or > 90%
     "tp_under_20": 0.30,               # entry < 20% or > 80%
     "tp_standard": 0.20,               # standard TP
-    # Adaptive stop-loss by entry price
-    "sl_under_05": -0.15,              # entry < 5% or > 95%
-    "sl_under_10": -0.10,              # entry < 10% or > 90%
-    "sl_under_20": -0.15,              # entry < 20% or > 80%
+    # Adaptive stop-loss by entry price (SL re-anchored to bid, wider for extremes;
+    # 0 = price-based SL disabled for that bucket)
+    "sl_under_05": 0.0,                # entry < 5% or > 95% — price-based SL off
+    "sl_under_10": -0.40,              # entry < 10% or > 90%
+    "sl_under_20": -0.25,              # entry < 20% or > 80%
     "sl_standard": -0.15,              # standard SL
+    "catastrophic_stop_pct": 0.50,     # extreme entries: close if bid <= entry × 0.50
+    "execution_mode": "maker",         # "maker" (limit, fee 0) or "taker" (walk book)
     "cycle_interval_minutes": 30,
     "max_open_positions": 5,
     "min_volume": 5000,
@@ -70,8 +98,9 @@ DEFAULT_SETTINGS = {
     "long_term_position_ratio": 0.40,
     "pre_expiry_lock_days": 5,
     "min_days_to_expiry_entry": 7,
-    "stale_position_days": 5,          # close dead positions faster to free heat/capital
+    "stale_position_days": 0,          # 0 = disabled — stale rule off by default
     "stale_position_movement": 0.03,
+    "max_position_age_days": 60,       # zombie close only for positions with NO end_date
     # Tier 2: dynamic position sizing multipliers
     "size_multiplier_high_conf_large_edge": 1.25,  # high conf + edge ≥10% → $187.5
     "size_multiplier_high_conf_base": 1.00,        # high conf + edge 5-10% → $150
@@ -142,15 +171,16 @@ def load_settings() -> dict:
         "max_drawdown_pause_pct": 0.15,
         "min_opportunity_score": 50.0,
         "max_positions_per_category": 2,
-        # Adaptive TP/SL/Hard-stop by entry price (updated 2026-06-12)
+        # Adaptive TP/SL/Hard-stop by entry price (updated 2026-07-30)
         "tp_under_05": 1.00,
         "tp_under_10": 0.50,
         "tp_under_20": 0.30,
         "tp_standard": 0.20,
-        "sl_under_05": -0.15,
-        "sl_under_10": -0.10,
-        "sl_under_20": -0.15,
+        "sl_under_05": 0.0,            # price-based SL off for extreme entries
+        "sl_under_10": -0.40,
+        "sl_under_20": -0.25,
         "sl_standard": -0.15,
+        "catastrophic_stop_pct": 0.50,
         "hard_stop_pp_under_05": 0.10,
         "hard_stop_pp_under_10": 0.07,
         "hard_stop_pp_under_20": 0.07,
@@ -352,6 +382,10 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
         cat_count = open_categories.get(category, 0) if category not in ("", "unknown") else 0
         score -= min(10.0, cat_count * 5.0)
 
+        # 6. Fee-free category bonus (+10): geopolitics markets pay 0 taker fee
+        if "geopolitics" in category.lower():
+            score += 10.0
+
         return round(max(0.0, min(100.0, score)), 1)
 
     def run_cycle(self) -> dict:
@@ -409,11 +443,11 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                         tp = self.settings.get("tp_standard", 0.20)
 
                     if entry_p < 0.05 or entry_p > 0.95:
-                        sl = self.settings.get("sl_under_05", -0.15)
+                        sl = self.settings.get("sl_under_05", 0.0)
                     elif entry_p < 0.10 or entry_p > 0.90:
-                        sl = self.settings.get("sl_under_10", -0.10)
+                        sl = self.settings.get("sl_under_10", -0.40)
                     elif entry_p < 0.20 or entry_p > 0.80:
-                        sl = self.settings.get("sl_under_20", -0.15)
+                        sl = self.settings.get("sl_under_20", -0.25)
                     else:
                         sl = self.settings.get("sl_standard", -0.15)
 
@@ -421,6 +455,8 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                     mkt = mkt_map.get(market_id)
                     close_liquidity = getattr(mkt, 'liquidity', None) if mkt else None
                     live_price = pos.get("current_price", entry_p)
+                    exec_mode = self.settings.get("execution_mode", "maker")
+                    book = None
                     if mkt:
                         token_id = mkt.yes_token_id if side == "YES" else mkt.no_token_id
                         if token_id:
@@ -428,10 +464,16 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                             if fetched is not None:
                                 live_price = fetched
                                 self.trader.update_position_price(market_id, live_price)
-                                # Recalculate NET pnl with live price (includes closing fee)
+                                # Recalculate NET pnl with live price (category-aware taker fee estimate)
                                 shares = pos.get("shares", 0)
-                                live_value = shares * live_price
-                                pnl_pct = (live_value * (1 - FEE_RATE) - pos["cost_basis"]) / pos["cost_basis"] if pos["cost_basis"] > 0 else 0
+                                net_value = shares * live_price - taker_fee(shares, live_price, pos.get("category", ""))
+                                pnl_pct = (net_value - pos["cost_basis"]) / pos["cost_basis"] if pos["cost_basis"] > 0 else 0
+                            # Fetch the order book once per position — used for SL
+                            # evaluation (best bid) and passed to close_position
+                            try:
+                                book = self.fetcher.get_order_book(token_id)
+                            except Exception:
+                                book = None
 
                     # Auto-close if market end_date has passed (+ 4h grace)
                     try:
@@ -442,22 +484,46 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                             if end_dt and end_dt.tzinfo is None:
                                 end_dt = end_dt.replace(tzinfo=timezone.utc)
                             if end_dt and datetime.now(timezone.utc) > end_dt + timedelta(hours=4):
-                                log(f"⏰ Market expired on {end_date_str[:10]}: {pos['question'][:50]}")
-                                self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="expired")
-                                trades_closed += 1
+                                # Try binary payout from the market's final resolution
+                                resolution = self.fetcher.get_market_resolution(market_id)
+                                if resolution in ("YES", "NO"):
+                                    side_outcome = 1.0 if side == resolution else 0.0
+                                    log(f"⏰ Resolved {resolution} — binary payout ({side_outcome:.0f}/share): {pos['question'][:50]}")
+                                    self.trader.close_position(
+                                        market_id, live_price, liquidity=close_liquidity,
+                                        execution_mode=exec_mode, book=book,
+                                        reason="expired", payout=side_outcome,
+                                    )
+                                    try:
+                                        self.db.resolve_prob_estimates(market_id, side_outcome)
+                                    except Exception:
+                                        pass
+                                    trades_closed += 1
+                                    continue
+                                # Resolution not available yet (UMA window)
+                                days_past = (datetime.now(timezone.utc) - end_dt).days
+                                if days_past > 7:
+                                    log(f"⏰ Expired {days_past}d ago, still unresolved — closing at last price: {pos['question'][:50]}")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="expired_unresolved")
+                                    trades_closed += 1
+                                    continue
+                                log(f"⏳ Expired {end_date_str[:10]}, awaiting resolution: {pos['question'][:50]}")
                                 continue
                     except Exception:
                         pass
 
-                    # Fallback: auto-close positions open more than 14 days
+                    # Fallback: zombie close — only for positions with NO end_date.
+                    # Positions with a future end_date hold to resolution.
                     try:
-                        opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
-                        days_open = (datetime.now(timezone.utc) - opened_at).days
-                        if days_open >= 14:
-                            log(f"⏰ Closing zombie position ({days_open}d): {pos['question'][:50]}")
-                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="expired")
-                            trades_closed += 1
-                            continue
+                        if not pos.get("end_date", ""):
+                            opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
+                            days_open = (datetime.now(timezone.utc) - opened_at).days
+                            max_age = self.settings.get("max_position_age_days", 60)
+                            if days_open >= max_age:
+                                log(f"⏰ Closing zombie position ({days_open}d, no end_date): {pos['question'][:50]}")
+                                self.trader.close_position(market_id, live_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="expired")
+                                trades_closed += 1
+                                continue
                     except Exception:
                         pass
 
@@ -474,7 +540,7 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 days_left = (end_dt - datetime.now(timezone.utc)).days
                                 if days_left <= pre_lock_days:
                                     log(f"🔒 Pre-expiry lock ({days_left}d left, +{pnl_pct*100:.1f}%): {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="pre_expiry_lock")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="pre_expiry_lock")
                                     trades_closed += 1
                                     continue
                     except Exception:
@@ -511,19 +577,19 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 move_pp = no_price - no_at_entry
                         if dominant_moved:
                             log(f"🚨 HARD STOP: dominant side moved +{move_pp*100:.1f}pp against us — {pos['question'][:50]}")
-                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="hard_stop")
+                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="hard_stop")
                             trades_closed += 1
                             continue
 
-                    # ── RISK v3: Stale close (re-enabled, contrarian-aware) ──
+                    # ── RISK v3: Stale close (contrarian-aware; disabled by default) ──
                     # If after N days the market is still at the same extreme (or more),
                     # the contrarian thesis is not working — free the capital.
-                    stale_days = self.settings.get("stale_position_days", 7)
+                    stale_days = self.settings.get("stale_position_days", 0)
                     stale_move = self.settings.get("stale_position_movement", 0.03)
                     try:
                         opened_at = datetime.fromisoformat(pos["opened_at"].replace("Z", "+00:00"))
                         days_open = (datetime.now(timezone.utc) - opened_at).days
-                        if days_open >= stale_days:
+                        if stale_days > 0 and days_open >= stale_days:
                             entry_p = pos.get("entry_price", pos.get("current_price", 0))
                             curr_p = live_price
                             if entry_p > 0:
@@ -534,19 +600,19 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                                 if side == "YES" and curr_p < entry_p:
                                     # YES went down (market favors NO more) — against us
                                     log(f"💤 Stale+against ({days_open}d, YES fell {movement*100:.1f}%) — cutting: {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="stale")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="stale")
                                     trades_closed += 1
                                     continue
                                 elif side == "NO" and curr_p < entry_p:
                                     # NO went down (market favors YES more) — against us
                                     log(f"💤 Stale+against ({days_open}d, NO fell {movement*100:.1f}%) — cutting: {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="stale")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="stale")
                                     trades_closed += 1
                                     continue
                                 elif movement < stale_move:
                                     # No significant movement at all — free capital
                                     log(f"💤 Stale trade ({days_open}d, {movement*100:.1f}% move) — freeing capital: {pos['question'][:50]}")
-                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="stale")
+                                    self.trader.close_position(market_id, live_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="stale")
                                     trades_closed += 1
                                     continue
                     except Exception:
@@ -555,19 +621,39 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                     if pnl_pct >= tp:
                         log(f"✅ TP hit on {pos['question'][:50]} (+{pnl_pct*100:.1f}%) — closing")
                         try:
-                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="take_profit")
+                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="take_profit")
                             trades_closed += 1
                         except Exception as e:
                             log(f"Close error: {e}", "error")
                             errors += 1
-                    elif pnl_pct <= sl:
-                        log(f"🛑 SL hit on {pos['question'][:50]} ({pnl_pct*100:.1f}%) — closing")
-                        try:
-                            self.trader.close_position(market_id, live_price, liquidity=close_liquidity, reason="stop_loss")
-                            trades_closed += 1
-                        except Exception as e:
-                            log(f"Close error: {e}", "error")
-                            errors += 1
+                    else:
+                        # ── SL re-anchored to best bid (mid fallback) ──
+                        sl_price = live_price
+                        if book and book.get("bids"):
+                            sl_price = book["bids"][0][0]
+                        shares = pos.get("shares", 0)
+                        net_sl_value = shares * sl_price - taker_fee(shares, sl_price, pos.get("category", ""))
+                        pnl_sl = (net_sl_value - pos["cost_basis"]) / pos["cost_basis"] if pos["cost_basis"] > 0 else 0
+
+                        # Catastrophic stop: an extreme entry collapsing to <= 50% of entry
+                        # means the market priced in a catalyst — thesis invalidated
+                        cat_stop = self.settings.get("catastrophic_stop_pct", 0.50)
+                        if (entry_p < 0.05 or entry_p > 0.95) and cat_stop > 0 and sl_price <= entry_p * cat_stop:
+                            log(f"🚨 CATALYST STOP: bid {sl_price:.4f} ≤ {cat_stop:.0%}× entry {entry_p:.4f} — {pos['question'][:50]}")
+                            try:
+                                self.trader.close_position(market_id, sl_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="catalyst_stop")
+                                trades_closed += 1
+                            except Exception as e:
+                                log(f"Close error: {e}", "error")
+                                errors += 1
+                        elif sl != 0 and pnl_sl <= sl:
+                            log(f"🛑 SL hit on {pos['question'][:50]} ({pnl_sl*100:.1f}% @ bid {sl_price:.4f}) — closing")
+                            try:
+                                self.trader.close_position(market_id, sl_price, liquidity=close_liquidity, execution_mode=exec_mode, book=book, reason="stop_loss")
+                                trades_closed += 1
+                            except Exception as e:
+                                log(f"Close error: {e}", "error")
+                                errors += 1
 
                 # refresh portfolio after closes
                 portfolio = self.db.get_portfolio()
@@ -892,6 +978,14 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                         dynamic_size = max(dynamic_size, 100.0)
 
                         size = min(dynamic_size, bal)
+                        exec_mode = self.settings.get("execution_mode", "maker")
+                        open_book = None
+                        open_token = market.yes_token_id if side == "YES" else market.no_token_id
+                        if open_token:
+                            try:
+                                open_book = self.fetcher.get_order_book(open_token)
+                            except Exception:
+                                open_book = None
                         self.trader.open_position(
                             market_id=market.id,
                             question=market.question,
@@ -904,8 +998,31 @@ Do NOT estimate probabilities. Do NOT give percentages. Do NOT explain reasoning
                             end_date=market.end_date,
                             liquidity=market.liquidity,
                             category=market.category,
+                            execution_mode=exec_mode,
+                            book=open_book,
+                            settings_version=SETTINGS_VERSION,
+                            entry_bucket=entry_bucket(entry_price),
                         )
                         trades_opened += 1
+                        # Record the probability estimate for calibration
+                        # (Brier score filled in when the market resolves)
+                        try:
+                            model_name = getattr(getattr(self.researcher, "llm", None), "model", "") or ""
+                            self.db.add_prob_estimate({
+                                "market_id": market.id,
+                                "question": market.question,
+                                "side": side,
+                                "estimated_prob": round(min(entry_price + edge, 0.99), 4),
+                                "confidence": confidence,
+                                "edge": round(edge, 4),
+                                "market_price": round(entry_price, 4),
+                                "as_of": datetime.now(timezone.utc).isoformat(),
+                                "model": model_name,
+                                "prompt_version": "contrarian-v2",
+                                "settings_version": SETTINGS_VERSION,
+                            })
+                        except Exception as e:
+                            log(f"   prob_estimate write failed: {e}", "warning")
                         # Update in-memory open_pos and category count to prevent re-entry in same cycle
                         open_pos[market.id] = {"entry_price": entry_price, "category": market.category}
                         open_categories[category] = open_categories.get(category, 0) + 1

@@ -123,6 +123,69 @@ def test_stats():
     assert stats["wins"] == 1
 
 
+def test_prob_estimate_add_and_resolve():
+    db = PortfolioDatabase()
+    est = db.add_prob_estimate({
+        "market_id": "m1",
+        "question": "Q?",
+        "side": "YES",
+        "estimated_prob": 0.30,
+        "confidence": "high",
+        "edge": 0.10,
+        "market_price": 0.20,
+        "as_of": "2026-07-30T00:00:00+00:00",
+        "model": "test-model",
+        "prompt_version": "contrarian-v2",
+        "settings_version": "v5-test",
+    })
+    assert est["estimate_id"]
+    assert est["created_at"]
+
+    rows = db.get_prob_estimates(market_id="m1")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] is None
+    assert rows[0]["brier"] is None
+
+    resolved = db.resolve_prob_estimates("m1", 1.0)
+    assert resolved == 1
+    rows = db.get_prob_estimates(market_id="m1")
+    assert rows[0]["outcome"] == pytest.approx(1.0)
+    assert rows[0]["brier"] == pytest.approx((0.30 - 1.0) ** 2)
+
+    # Already resolved — nothing left to resolve
+    assert db.resolve_prob_estimates("m1", 0.0) == 0
+
+
+def test_position_marks_roundtrip():
+    db = PortfolioDatabase()
+    db.add_position_mark("m1", 0.20, ts="2026-07-30T00:00:00+00:00")
+    db.add_position_mark("m1", 0.25)
+    db.add_position_mark("m2", 0.80)
+
+    marks = db.get_position_marks("m1")
+    assert len(marks) == 2
+    assert marks[0]["price"] == pytest.approx(0.20)
+    assert marks[1]["price"] == pytest.approx(0.25)
+    assert marks[1]["ts"]  # auto-generated timestamp
+
+
+def test_trade_new_columns_roundtrip():
+    db = PortfolioDatabase()
+    db.add_trade({
+        "type": "OPEN",
+        "market_id": "m1",
+        "side": "YES",
+        "price": 0.20,
+        "settings_version": "v5-test",
+        "entry_bucket": "0.10-0.20",
+        "execution_mode": "maker",
+    })
+    trade = db.get_trades()[0]
+    assert trade["settings_version"] == "v5-test"
+    assert trade["entry_bucket"] == "0.10-0.20"
+    assert trade["execution_mode"] == "maker"
+
+
 def test_json_migration(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(portfolio_db, "DATA_DIR", tmp)

@@ -14,7 +14,7 @@ from typing import Optional
 import requests
 
 from .market_fetcher import Market, MarketFetcher
-from .paper_trader import FEE_RATE, _apply_slippage
+from .paper_trader import _apply_slippage, fee_rate_for_category, taker_fee
 
 
 CLOB_API = "https://clob.polymarket.com"
@@ -94,13 +94,16 @@ class Backtester:
         entry_mid: float,
         exit_mid: float,
         liquidity: float,
+        category: Optional[str] = None,
     ) -> tuple[float, float, float, float]:
         """Returns (entry_fill, exit_fill, pnl, pnl_pct)."""
         entry_fill = _apply_slippage(entry_mid, amount, liquidity, action="buy")
-        shares = (amount * (1 - FEE_RATE)) / entry_fill if entry_fill > 0 else 0
+        rate = fee_rate_for_category(category)
+        # Solve shares so that shares*fill + taker fee == amount exactly
+        shares = amount / (entry_fill * (1 + rate * (1 - entry_fill))) if entry_fill > 0 else 0
         notional = shares * exit_mid
         exit_fill = _apply_slippage(exit_mid, notional, liquidity, action="sell")
-        proceeds = shares * exit_fill * (1 - FEE_RATE)
+        proceeds = shares * exit_fill - taker_fee(shares, exit_fill, category)
         pnl = proceeds - amount
         return entry_fill, exit_fill, pnl, (pnl / amount if amount > 0 else 0)
 
@@ -146,7 +149,7 @@ class Backtester:
                 entry_mid = position["entry_yes"]
                 exit_mid = yes_price if position["side"] == "NO" else no_price
                 entry_fill, exit_fill, pnl, pnl_pct = self._net_pnl(
-                    amount, entry_mid, exit_mid, market.liquidity
+                    amount, entry_mid, exit_mid, market.liquidity, market.category
                 )
                 trades.append(
                     SimulatedTrade(
@@ -222,7 +225,7 @@ class Backtester:
 
             if reason:
                 entry_fill, exit_fill, pnl, pnl_pct_net = self._net_pnl(
-                    amount, position["entry_mid"], current_mid, market.liquidity
+                    amount, position["entry_mid"], current_mid, market.liquidity, market.category
                 )
                 trades.append(
                     SimulatedTrade(
